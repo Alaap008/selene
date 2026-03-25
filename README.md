@@ -1,3 +1,14 @@
+---
+title: Customer Service Agent OpenEnv
+emoji: 🎧
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 8000
+tags:
+  - openenv
+---
+
 # Customer Service Agent — OpenEnv Environment
 
 An AI agent that resolves customer support tickets by querying internal systems, communicating with customers, and taking actions (refunds, escalations). Built for the [OpenEnv](https://huggingface.co/openenv) challenge.
