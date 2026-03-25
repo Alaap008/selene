@@ -1,0 +1,37 @@
+version: "1.0"
+
+environment:
+  name: "CustomerServiceAgent"
+  description: >
+    A real-world OpenEnv environment simulating an AI customer service agent.
+    The agent resolves support tickets (order lookups, refund processing,
+    fraud detection) by interacting with mock internal APIs and communicating
+    with simulated customers.
+  docker_image: "openenv-support-agent"
+  port: 8000
+
+  action_type: "models.Action"
+  observation_type: "models.Observation"
+  reward_type: "models.Reward"
+
+  endpoints:
+    step: "/step"
+    reset: "/reset"
+    state: "/state"
+    tasks: "/tasks"
+    grader: "/grader"
+    baseline: "/baseline"
+
+  tasks:
+    - id: "easy"
+      description: "Look up an order status and relay tracking info to the customer."
+      difficulty: "easy"
+    - id: "medium"
+      description: "Process a standard refund after verifying policy compliance."
+      difficulty: "medium"
+    - id: "hard"
+      description: "Handle fraud-flagged customers, partial refunds, or escalations."
+      difficulty: "hard"
+
+  max_steps: 20
+  reward_range: [-1.0, 1.0]
