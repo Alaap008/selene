@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.dockerignore
+*.md
+.env
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
