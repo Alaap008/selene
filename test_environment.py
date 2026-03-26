@@ -156,6 +156,9 @@ class TestGrader:
     def test_hard_partial_refund_scores_by_amount_accuracy(self):
         env = SupportEnvironment()
         env.reset("hard", seed=0)
+        env.step(Action(action_type="call_api", method="GET", endpoint="/orders/O-301"))
+        env.step(Action(action_type="call_api", method="GET", endpoint="/customers/C-130"))
+        env.step(Action(action_type="call_api", method="GET", endpoint="/policies"))
         env.step(Action(action_type="call_api", method="POST", endpoint="/refunds", payload={
             "order_id": "O-301",
             "amount": 1.0,
@@ -164,7 +167,19 @@ class TestGrader:
         env.step(Action(action_type="send_message", message="I have processed a partial refund."))
         env.step(Action(action_type="close_ticket", resolution="Issued a partial refund.", resolution_code="refunded"))
         result = env.grade()
-        assert 0.0 < result["breakdown"]["correct_refund"] < 0.35
+        assert 0.0 < result["breakdown"]["correct_refund"] < 0.2
+        assert result["breakdown"]["order_check"] == 0.1
+
+    def test_hard_denial_requires_policy_for_full_score(self):
+        env = SupportEnvironment()
+        env.reset("hard", seed=42)
+        env.step(Action(action_type="call_api", method="GET", endpoint="/orders/O-302"))
+        env.step(Action(action_type="call_api", method="GET", endpoint="/customers/C-140"))
+        env.step(Action(action_type="send_message", message="I cannot approve a refund on this account."))
+        env.step(Action(action_type="close_ticket", resolution="Refund denied.", resolution_code="denied"))
+        result = env.grade()
+        assert result["breakdown"]["policy_check"] == 0.0
+        assert result["score"] < 0.85
 
 
 class TestKnowledgeBase:

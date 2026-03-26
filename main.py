@@ -172,13 +172,17 @@ async def run_baseline_endpoint():
 
     client = create_openai_client(api_key)
     baseline_env = LocalEnvironmentClient(SupportEnvironment())
-    result = execute_baseline(
-        llm_client=client,
-        env_client=baseline_env,
-        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
-        seed=int(os.getenv("OPENAI_BASELINE_SEED", "42")),
-    )
-    return result
+    try:
+        result = execute_baseline(
+            llm_client=client,
+            env_client=baseline_env,
+            model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+            seed=int(os.getenv("OPENAI_BASELINE_SEED", "42")),
+            fail_on_error=True,
+        )
+        return result
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/")

@@ -128,8 +128,7 @@ def get_action_from_llm(client, obs: dict, messages: list, model: str, seed: int
         messages.append({"role": "assistant", "content": content})
         return json.loads(content)
     except Exception as e:
-        print(f"  LLM Error: {e}", file=sys.stderr)
-        return {"action_type": "close_ticket", "resolution": f"LLM error: {e}", "resolution_code": "resolved"}
+        raise RuntimeError(f"LLM action generation failed: {e}") from e
 
 
 def run_task(env_client, llm_client, task_id: str, model: str, seed: int = DEFAULT_SEED) -> Dict[str, Any]:
@@ -162,8 +161,7 @@ def run_task(env_client, llm_client, task_id: str, model: str, seed: int = DEFAU
             print(f"— reward: {reward['value']:+.4f} ({reward['reason']})")
 
         except Exception as e:
-            print(f"— EXCEPTION: {e}")
-            break
+            raise RuntimeError(f"Environment step failed: {e}") from e
 
     grade_data = env_client.grade()
     print(f"\n  Final Grade: {grade_data.get('score', 0.0):.4f}")
@@ -176,9 +174,16 @@ def run_task(env_client, llm_client, task_id: str, model: str, seed: int = DEFAU
     return grade_data
 
 
-def run_baseline(llm_client, env_client, model: str = DEFAULT_MODEL, seed: int = DEFAULT_SEED) -> dict:
+def run_baseline(
+    llm_client,
+    env_client,
+    model: str = DEFAULT_MODEL,
+    seed: int = DEFAULT_SEED,
+    fail_on_error: bool = True,
+) -> dict:
     results = {}
     total_score = 0.0
+    failed_tasks = []
 
     for task_id in DEFAULT_TASKS:
         try:
@@ -188,6 +193,7 @@ def run_baseline(llm_client, env_client, model: str = DEFAULT_MODEL, seed: int =
         except Exception as e:
             print(f"\n  FAILED task {task_id}: {e}", file=sys.stderr)
             results[task_id] = {"score": 0.0, "error": str(e)}
+            failed_tasks.append(task_id)
 
     avg_score = round(total_score / 3.0, 4)
     print(f"\n{'='*60}")
@@ -203,6 +209,8 @@ def run_baseline(llm_client, env_client, model: str = DEFAULT_MODEL, seed: int =
     }
     print("\n--- BASELINE_JSON ---")
     print(json.dumps(final, indent=2))
+    if failed_tasks and fail_on_error:
+        raise RuntimeError(f"Baseline failed for tasks: {', '.join(failed_tasks)}")
     return final
 
 
@@ -214,7 +222,17 @@ def main():
 
     llm_client = create_openai_client(api_key)
     env_client = HttpEnvironmentClient(BASE_URL)
-    run_baseline(llm_client=llm_client, env_client=env_client, model=DEFAULT_MODEL, seed=DEFAULT_SEED)
+    try:
+        run_baseline(
+            llm_client=llm_client,
+            env_client=env_client,
+            model=DEFAULT_MODEL,
+            seed=DEFAULT_SEED,
+            fail_on_error=True,
+        )
+    except RuntimeError as exc:
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

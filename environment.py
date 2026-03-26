@@ -539,6 +539,7 @@ class SupportEnvironment:
         elif self.task_id == "hard":
             expected_denied = expected.get("refund_denied", False)
             refund_order = expected.get("refund_order", "")
+            looked_up_order = any("GET /orders/" in h for h in self.history)
 
             if expected_denied:
                 # Agent should NOT have issued a refund
@@ -546,7 +547,7 @@ class SupportEnvironment:
                     o.get("refunded") for o in self.db.get("orders", {}).values()
                 )
                 if not any_refunded:
-                    breakdown["correct_denial"] = 0.35
+                    breakdown["correct_denial"] = 0.2
                 else:
                     breakdown["correct_denial"] = 0.0  # catastrophic failure
                 score += breakdown["correct_denial"]
@@ -558,14 +559,17 @@ class SupportEnvironment:
                 if order.get("refunded"):
                     amt = order.get("refund_amount", 0)
                     if amt > max_refund:
-                        breakdown["correct_refund"] = 0.05
+                        breakdown["correct_refund"] = 0.0
                     else:
                         distance = abs(float(amt) - float(expected_amount))
                         closeness = max(0.0, 1.0 - (distance / max(float(expected_amount), 1.0)))
-                        breakdown["correct_refund"] = round(0.35 * closeness, 4)
+                        breakdown["correct_refund"] = round(0.2 * closeness, 4)
                 else:
                     breakdown["correct_refund"] = 0.0
                 score += breakdown.get("correct_refund", 0.0)
+
+            breakdown["order_check"] = 0.1 if looked_up_order else 0.0
+            score += breakdown["order_check"]
 
             # Did the agent check the customer profile?
             checked_customer = any("/customers/" in h for h in self.history)
@@ -574,7 +578,7 @@ class SupportEnvironment:
 
             # Did the agent check policies?
             checked_policy = any("/policies" in h for h in self.history)
-            breakdown["policy_check"] = 0.1 if checked_policy else 0.0
+            breakdown["policy_check"] = 0.15 if checked_policy else 0.0
             score += breakdown["policy_check"]
 
             # Did the agent use knowledge base?
