@@ -10,10 +10,11 @@ Implements reset(), step(), state(), and grade() with:
   - Meaningful close_ticket reward via partial grading
 """
 
-from models import Action, Observation, Reward, Info
 import json
-import random
 import hashlib
+import random
+
+from models import Action, Observation, Reward, Info
 
 MAX_STEPS = 20
 STEP_DECAY = -0.01
@@ -135,7 +136,13 @@ HARD_VARIANTS = [
             "customers": {"C-130": {"name": "Grace P.", "fraud_flag": False}},
             "policies": {"standard_refund_days": 30, "partial_refund_policy": "If past refund window, only partial refund for missing items. Max refund = price of missing items."},
         },
-        "expected": {"refund_order": "O-301", "max_refund": 300.0, "past_window": True, "resolution_code": "refunded"},
+        "expected": {
+            "refund_order": "O-301",
+            "refund_amount": 300.0,
+            "max_refund": 300.0,
+            "past_window": True,
+            "resolution_code": "refunded",
+        },
     },
     {
         "id": "T-H03",
@@ -168,6 +175,15 @@ KNOWLEDGE_BASE = [
     {"id": "KB-004", "title": "Order Status Responses", "content": "Always provide the tracking number and current status. If the order is delayed, apologise and provide the estimated delivery date."},
     {"id": "KB-005", "title": "Escalation Protocol", "content": "Escalate to a supervisor when: (1) customer insists after a denial, (2) the refund amount exceeds $500, or (3) the case involves legal threats."},
 ]
+
+
+def _score_text_mentions(text: str, required_phrases: list[str], weight: float) -> float:
+    """Score how many required phrases appear in a piece of text."""
+    if not required_phrases:
+        return 0.0
+    text_lower = text.lower()
+    mentions_found = sum(1 for phrase in required_phrases if phrase.lower() in text_lower)
+    return round(weight * (mentions_found / len(required_phrases)), 4)
 
 # ---------------------------------------------------------------------------
 # Simulated customer replies based on agent messages
@@ -478,13 +494,19 @@ class SupportEnvironment:
         score += breakdown["resolution_code"]
 
         if self.task_id == "easy":
-            # Did the agent retrieve the correct order?
+            # Reward the agent for telling the customer the right facts,
+            # not only for putting them in the internal close summary.
             resolution = self.db.get("ticket_resolution", "").lower()
             must_mention = expected.get("must_mention", [])
-            mentions_found = sum(1 for m in must_mention if m.lower() in resolution)
-            mention_ratio = mentions_found / max(len(must_mention), 1)
-            breakdown["info_accuracy"] = round(0.5 * mention_ratio, 4)
-            score += breakdown["info_accuracy"]
+            customer_message_text = " ".join(self.messages_sent)
+            breakdown["customer_response_accuracy"] = _score_text_mentions(
+                customer_message_text, must_mention, 0.35
+            )
+            breakdown["close_summary_accuracy"] = _score_text_mentions(
+                resolution, must_mention, 0.15
+            )
+            score += breakdown["customer_response_accuracy"]
+            score += breakdown["close_summary_accuracy"]
 
             # Did the agent look up the order at all?
             looked_up = any("GET /orders/" in h for h in self.history)
@@ -532,12 +554,15 @@ class SupportEnvironment:
                 # Agent should have issued a partial/correct refund
                 order = self.db.get("orders", {}).get(refund_order, {})
                 max_refund = expected.get("max_refund", order.get("amount", 0))
+                expected_amount = expected.get("refund_amount", max_refund)
                 if order.get("refunded"):
                     amt = order.get("refund_amount", 0)
-                    if amt <= max_refund:
-                        breakdown["correct_refund"] = 0.35
+                    if amt > max_refund:
+                        breakdown["correct_refund"] = 0.05
                     else:
-                        breakdown["correct_refund"] = 0.1  # over-refunded
+                        distance = abs(float(amt) - float(expected_amount))
+                        closeness = max(0.0, 1.0 - (distance / max(float(expected_amount), 1.0)))
+                        breakdown["correct_refund"] = round(0.35 * closeness, 4)
                 else:
                     breakdown["correct_refund"] = 0.0
                 score += breakdown.get("correct_refund", 0.0)

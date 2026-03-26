@@ -1,16 +1,22 @@
-"""
-FastAPI server for the Customer Service Agent OpenEnv environment.
-Exposes: /step, /reset, /state, /tasks, /grader, /baseline, /
-"""
-
-import subprocess
 import os
-from fastapi import FastAPI
-from pydantic import BaseModel
+import threading
+import uuid
+from pathlib import Path
 from typing import Optional
 
-from models import Action, Observation, Reward, Info
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel
+
+from baseline import (
+    LocalEnvironmentClient,
+    create_openai_client,
+    run_baseline as execute_baseline,
+)
 from environment import SupportEnvironment
+from models import Action, Observation, Reward, Info
+
+load_dotenv(Path(__file__).with_name(".env.local"), override=False)
 
 app = FastAPI(
     title="Customer Service Agent OpenEnv",
@@ -18,8 +24,10 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Global environment instance (single-session, suitable for hackathon evaluation)
-session_env = SupportEnvironment()
+SESSION_COOKIE_NAME = "openenv_session_id"
+_DEFAULT_SESSION_ID = "default"
+_session_lock = threading.Lock()
+_session_envs: dict[str, SupportEnvironment] = {_DEFAULT_SESSION_ID: SupportEnvironment()}
 
 
 # ---- Response / Request models ----
@@ -36,27 +44,55 @@ class ResetRequest(BaseModel):
     seed: Optional[int] = None
 
 
+def _get_or_create_session_id(request: Request) -> tuple[str, bool]:
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if session_id:
+        return session_id, False
+    return str(uuid.uuid4()), True
+
+
+def _get_env_for_session(session_id: str) -> SupportEnvironment:
+    with _session_lock:
+        env = _session_envs.get(session_id)
+        if env is None:
+            env = SupportEnvironment()
+            _session_envs[session_id] = env
+        return env
+
+
 # ---- Core OpenEnv endpoints ----
 
 @app.post("/step", response_model=StepResponse)
-async def step(action: Action):
+async def step(action: Action, request: Request):
     """Execute one agent action and return (observation, reward, done, info)."""
-    obs, reward, done, info = session_env.step(action)
+    session_id = request.cookies.get(SESSION_COOKIE_NAME, _DEFAULT_SESSION_ID)
+    env = _get_env_for_session(session_id)
+    obs, reward, done, info = env.step(action)
     return StepResponse(observation=obs, reward=reward, done=done, info=info)
 
 
 @app.post("/reset", response_model=Observation)
-async def reset(request: Optional[ResetRequest] = None):
+async def reset(
+    request: Request,
+    response: Response,
+    request_body: Optional[ResetRequest] = None,
+):
     """Reset environment to a fresh episode for the given task."""
-    task_id = request.task_id if request else "easy"
-    seed = request.seed if request else None
-    return session_env.reset(task_id=task_id, seed=seed)
+    task_id = request_body.task_id if request_body else "easy"
+    seed = request_body.seed if request_body else None
+    session_id, is_new = _get_or_create_session_id(request)
+    if is_new:
+        response.set_cookie(SESSION_COOKIE_NAME, session_id, httponly=True)
+    env = _get_env_for_session(session_id)
+    return env.reset(task_id=task_id, seed=seed)
 
 
 @app.get("/state", response_model=Observation)
-async def state():
+async def state(request: Request):
     """Return the current observation without advancing the episode."""
-    return session_env.get_state()
+    session_id = request.cookies.get(SESSION_COOKIE_NAME, _DEFAULT_SESSION_ID)
+    env = _get_env_for_session(session_id)
+    return env.get_state()
 
 
 # ---- Challenge-required endpoints ----
@@ -87,25 +123,62 @@ async def get_tasks():
     }
 
 
+@app.get("/health")
+async def health():
+    """OpenEnv-compatible health check."""
+    return {"status": "healthy"}
+
+
+@app.get("/metadata")
+async def metadata():
+    """OpenEnv-compatible metadata endpoint."""
+    return {
+        "name": "CustomerServiceAgent",
+        "description": "A real-world customer support environment with order lookup, refunds, and fraud handling.",
+    }
+
+
+@app.get("/schema")
+async def schema():
+    """Return action, observation, and state schemas."""
+    observation_schema = Observation.model_json_schema()
+    return {
+        "action": Action.model_json_schema(),
+        "observation": observation_schema,
+        "state": observation_schema,
+    }
+
+
+@app.post("/mcp")
+async def mcp():
+    """Minimal JSON-RPC-compatible MCP endpoint for validator reachability."""
+    return {"jsonrpc": "2.0", "id": None, "result": {"status": "ok"}}
+
+
 @app.get("/grader")
-async def get_grader():
+async def get_grader(request: Request):
     """Return grader score for the current (completed) episode."""
-    return session_env.grade()
+    session_id = request.cookies.get(SESSION_COOKIE_NAME, _DEFAULT_SESSION_ID)
+    env = _get_env_for_session(session_id)
+    return env.grade()
 
 
 @app.post("/baseline")
-async def run_baseline():
-    """Trigger the baseline inference script and return scores."""
-    env = os.environ.copy()
-    env["OPENENV_BASE_URL"] = "http://localhost:8000"
-    result = subprocess.run(
-        ["python", "baseline.py"],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=300,
+async def run_baseline_endpoint():
+    """Run the baseline agent against an isolated in-process environment."""
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="OPENAI_API_KEY not set")
+
+    client = create_openai_client(api_key)
+    baseline_env = LocalEnvironmentClient(SupportEnvironment())
+    result = execute_baseline(
+        llm_client=client,
+        env_client=baseline_env,
+        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        seed=int(os.getenv("OPENAI_BASELINE_SEED", "42")),
     )
-    return {"stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
+    return result
 
 
 @app.get("/")

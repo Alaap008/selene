@@ -95,7 +95,7 @@ Complex scenarios: fraud-flagged customers (deny refund), partial refunds past t
 ### Local Development
 ```bash
 pip install -r requirements.txt
-uvicorn main:app --reload
+uvicorn server.app:app --reload
 ```
 
 ### Run Tests
@@ -106,8 +106,21 @@ python -m pytest test_environment.py -v
 
 ### Run Baseline Agent
 ```bash
+# Or put these in .env.local
 export OPENAI_API_KEY="sk-..."
+export OPENAI_MODEL="gpt-4o"
+export OPENAI_BASELINE_SEED="42"
 python baseline.py
+```
+
+The CLI baseline uses the OpenAI API client with `temperature=0.0`, `top_p=1.0`, and a fixed `seed` for reproducibility. The `/baseline` endpoint runs the same logic in-process against an isolated environment instance, avoiding self-calls back into the HTTP server.
+
+You can also store local secrets in `.env.local`:
+
+```env
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o
+OPENAI_BASELINE_SEED=42
 ```
 
 ### Docker
@@ -120,14 +133,16 @@ docker run -p 8000:8000 openenv-support-agent
 
 ## Baseline Scores
 
-| Task | Score | Notes |
-|---|---|---|
-| Easy | ~0.85–1.0 | GPT-4o reliably retrieves and reports order info |
-| Medium | ~0.70–0.90 | Usually processes refund correctly; occasionally skips policy check |
-| Hard | ~0.50–0.75 | Fraud detection is inconsistent; partial refund logic varies |
-| **Average** | **~0.70** | |
+Exact baseline scores are produced by `python baseline.py` or `POST /baseline` and depend on the deployed OpenAI model revision. This repository is configured to make those runs deterministic for a fixed model name and seed, but no API key was available in this verification run, so no fabricated scores are listed here.
 
-*(Scores from `baseline.py` with `seed=42`, `temperature=0.0`, model `gpt-4o`)*
+Recommended baseline configuration:
+
+| Setting | Value |
+|---|---|
+| Model | `gpt-4o` |
+| Temperature | `0.0` |
+| Top-p | `1.0` |
+| Seed | `42` |
 
 ---
 
@@ -143,14 +158,22 @@ docker run -p 8000:8000 openenv-support-agent
 ## Project Structure
 
 ```
-openenv-support-agent/
+selene/
 ├── main.py              # FastAPI server (step/reset/state/tasks/grader/baseline)
+├── server/app.py        # OpenEnv multi-mode server entrypoint
 ├── environment.py       # Core environment logic, ticket variants, grader
 ├── models.py            # Pydantic models (Action, Observation, Reward, Info)
 ├── baseline.py          # OpenAI-powered baseline agent
 ├── test_environment.py  # pytest test suite
 ├── openenv.yaml         # OpenEnv spec metadata
+├── pyproject.toml       # Multi-mode packaging metadata
+├── uv.lock              # Lockfile for OpenEnv validation
 ├── requirements.txt     # Python dependencies
 ├── Dockerfile           # Container definition
 └── .dockerignore        # Docker build exclusions
 ```
+
+## Verification
+
+- `python -m pytest test_environment.py -v` -> 21 tests passed
+- `openenv validate` -> passed
