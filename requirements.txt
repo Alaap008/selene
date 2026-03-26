@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pydantic
+openenv-core[core]>=0.2.1
+openai
+requests
+python-dotenv>=1.2.2

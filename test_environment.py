@@ -140,6 +140,32 @@ class TestGrader:
         result = env.grade()
         assert "breakdown" in result
 
+    def test_easy_requires_customer_facing_answer(self):
+        env = SupportEnvironment()
+        env.reset("easy", seed=42)
+        action = Action(
+            action_type="close_ticket",
+            resolution="Order is shipped with tracking TRK999.",
+            resolution_code="info_provided",
+        )
+        env.step(action)
+        result = env.grade()
+        assert result["breakdown"]["customer_response_accuracy"] == 0.0
+        assert result["score"] < 0.7
+
+    def test_hard_partial_refund_scores_by_amount_accuracy(self):
+        env = SupportEnvironment()
+        env.reset("hard", seed=0)
+        env.step(Action(action_type="call_api", method="POST", endpoint="/refunds", payload={
+            "order_id": "O-301",
+            "amount": 1.0,
+            "reason": "Partial refund",
+        }))
+        env.step(Action(action_type="send_message", message="I have processed a partial refund."))
+        env.step(Action(action_type="close_ticket", resolution="Issued a partial refund.", resolution_code="refunded"))
+        result = env.grade()
+        assert 0.0 < result["breakdown"]["correct_refund"] < 0.35
+
 
 class TestKnowledgeBase:
     def test_search_returns_results(self):

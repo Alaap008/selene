@@ -6,8 +6,10 @@ __pycache__/
 .dockerignore
 *.md
 .env
+.env.local
 .venv/
 venv/
 *.egg-info/
 dist/
 build/
+.uvpkg/

@@ -1,18 +1,20 @@
-"""
-Baseline inference script for the Customer Service Agent OpenEnv environment.
-Uses the OpenAI API (gpt-4o) to run a model agent against all 3 tasks.
-Reads OPENAI_API_KEY from environment variables.
-Produces a reproducible baseline score.
-"""
-
+import json
 import os
 import sys
-import requests
-import json
-import time
+from pathlib import Path
 from typing import Dict, Any
 
+import requests
+from dotenv import load_dotenv
+
+from environment import SupportEnvironment
+
+load_dotenv(Path(__file__).with_name(".env.local"), override=False)
+
 BASE_URL = os.getenv("OPENENV_BASE_URL", "http://localhost:8000")
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+DEFAULT_SEED = int(os.getenv("OPENAI_BASELINE_SEED", "42"))
+DEFAULT_TASKS = ("easy", "medium", "hard")
 
 SYSTEM_PROMPT = """\
 You are an AI Customer Service Agent. You resolve customer support tickets by:
@@ -53,17 +55,74 @@ Example: {"action_type": "close_ticket", "resolution": "Order O-100 is shipped w
 """
 
 
-def get_action_from_llm(client, obs: dict, messages: list) -> dict:
+def create_openai_client(api_key: str):
+    from openai import OpenAI
+
+    return OpenAI(api_key=api_key)
+
+
+class HttpEnvironmentClient:
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+
+    def reset(self, task_id: str, seed: int) -> dict:
+        response = self.session.post(
+            f"{self.base_url}/reset", json={"task_id": task_id, "seed": seed}, timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def step(self, action: dict) -> dict:
+        response = self.session.post(f"{self.base_url}/step", json=action, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    def grade(self) -> dict:
+        response = self.session.get(f"{self.base_url}/grader", timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+
+class LocalEnvironmentClient:
+    def __init__(self, env: SupportEnvironment | None = None):
+        self.env = env or SupportEnvironment()
+
+    def reset(self, task_id: str, seed: int) -> dict:
+        return self.env.reset(task_id=task_id, seed=seed).model_dump()
+
+    def step(self, action: dict) -> dict:
+        obs, reward, done, info = self.env.step(action=self._coerce_action(action))
+        return {
+            "observation": obs.model_dump(),
+            "reward": reward.model_dump(),
+            "done": done,
+            "info": info.model_dump(),
+        }
+
+    def grade(self) -> dict:
+        return self.env.grade()
+
+    @staticmethod
+    def _coerce_action(action: dict):
+        from models import Action
+
+        return Action(**action)
+
+
+def get_action_from_llm(client, obs: dict, messages: list, model: str, seed: int) -> dict:
     """Ask the LLM for the next action given the current observation."""
     obs_str = json.dumps(obs, indent=2)
     messages.append({"role": "user", "content": f"Current Observation:\n```json\n{obs_str}\n```\nWhat is your next action? Output ONLY the JSON action object."})
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model=model,
             messages=messages,
             response_format={"type": "json_object"},
-            temperature=0.0,  # deterministic for reproducibility
+            temperature=0.0,
+            top_p=1.0,
+            seed=seed,
         )
         content = response.choices[0].message.content
         messages.append({"role": "assistant", "content": content})
@@ -73,16 +132,13 @@ def get_action_from_llm(client, obs: dict, messages: list) -> dict:
         return {"action_type": "close_ticket", "resolution": f"LLM error: {e}", "resolution_code": "resolved"}
 
 
-def run_task(client, task_id: str, seed: int = 42) -> Dict[str, Any]:
+def run_task(env_client, llm_client, task_id: str, model: str, seed: int = DEFAULT_SEED) -> Dict[str, Any]:
     """Run a single task episode and return the grader score."""
     print(f"\n{'='*60}")
     print(f"  Task: {task_id}")
     print(f"{'='*60}")
 
-    # Reset
-    res = requests.post(f"{BASE_URL}/reset", json={"task_id": task_id, "seed": seed})
-    res.raise_for_status()
-    obs = res.json()
+    obs = env_client.reset(task_id=task_id, seed=seed)
     print(f"  Ticket: {obs['ticket_id']} — {obs['customer_request'][:80]}")
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -94,17 +150,11 @@ def run_task(client, task_id: str, seed: int = 42) -> Dict[str, Any]:
 
     while not done and step_count < max_steps:
         step_count += 1
-        action_dict = get_action_from_llm(client, obs, messages)
+        action_dict = get_action_from_llm(llm_client, obs, messages, model=model, seed=seed)
         print(f"  Step {step_count}: {action_dict.get('action_type', '?')} ", end="")
 
         try:
-            step_res = requests.post(f"{BASE_URL}/step", json=action_dict)
-            if step_res.status_code != 200:
-                print(f"— ERROR {step_res.status_code}")
-                obs["last_api_response"] = f"Server error: {step_res.text}"
-                continue
-
-            step_data = step_res.json()
+            step_data = env_client.step(action_dict)
             obs = step_data["observation"]
             reward = step_data["reward"]
             done = step_data["done"]
@@ -115,10 +165,7 @@ def run_task(client, task_id: str, seed: int = 42) -> Dict[str, Any]:
             print(f"— EXCEPTION: {e}")
             break
 
-    # Get final grade
-    time.sleep(0.3)
-    grade_res = requests.get(f"{BASE_URL}/grader")
-    grade_data = grade_res.json()
+    grade_data = env_client.grade()
     print(f"\n  Final Grade: {grade_data.get('score', 0.0):.4f}")
     if "breakdown" in grade_data:
         for k, v in grade_data["breakdown"].items():
@@ -129,21 +176,13 @@ def run_task(client, task_id: str, seed: int = 42) -> Dict[str, Any]:
     return grade_data
 
 
-def main():
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print(json.dumps({"error": "OPENAI_API_KEY not set"}))
-        sys.exit(1)
-
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key)
-
+def run_baseline(llm_client, env_client, model: str = DEFAULT_MODEL, seed: int = DEFAULT_SEED) -> dict:
     results = {}
     total_score = 0.0
 
-    for task_id in ["easy", "medium", "hard"]:
+    for task_id in DEFAULT_TASKS:
         try:
-            grade = run_task(client, task_id, seed=42)
+            grade = run_task(env_client, llm_client, task_id, model=model, seed=seed)
             results[task_id] = grade
             total_score += grade.get("score", 0.0)
         except Exception as e:
@@ -155,9 +194,27 @@ def main():
     print(f"  BASELINE COMPLETE — Average Score: {avg_score}")
     print(f"{'='*60}")
 
-    final = {"baseline_results": results, "total_score": round(total_score, 4), "average_score": avg_score}
+    final = {
+        "model": model,
+        "seed": seed,
+        "baseline_results": results,
+        "total_score": round(total_score, 4),
+        "average_score": avg_score,
+    }
     print("\n--- BASELINE_JSON ---")
     print(json.dumps(final, indent=2))
+    return final
+
+
+def main():
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        print(json.dumps({"error": "OPENAI_API_KEY not set"}))
+        sys.exit(1)
+
+    llm_client = create_openai_client(api_key)
+    env_client = HttpEnvironmentClient(BASE_URL)
+    run_baseline(llm_client=llm_client, env_client=env_client, model=DEFAULT_MODEL, seed=DEFAULT_SEED)
 
 
 if __name__ == "__main__":
