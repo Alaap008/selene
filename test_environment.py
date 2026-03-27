@@ -203,7 +203,7 @@ class TestGrader:
         env.step(Action(action_type="send_message", message="Refund denied per fraud policy."))
         env.step(Action(action_type="close_ticket", resolution="Denied per policy.", resolution_code="denied"))
         result = env.grade()
-        assert result["breakdown"]["correct_denial"] == round(0.35 * 0.5, 4)
+        assert result["breakdown"]["correct_denial"] == round(0.30 * 0.5, 4)
         assert result["breakdown"]["policy_check"] == 0.15
 
     def test_hard_full_research_unlocks_full_decision(self):
@@ -217,7 +217,7 @@ class TestGrader:
         env.step(Action(action_type="send_message", message="Refund denied per fraud policy."))
         env.step(Action(action_type="close_ticket", resolution="Denied per policy.", resolution_code="denied"))
         result = env.grade()
-        assert result["breakdown"]["correct_denial"] == 0.35
+        assert result["breakdown"]["correct_denial"] == 0.30
         assert result["score"] == 1.0
 
 
@@ -274,6 +274,56 @@ class TestAdversarialCustomers:
         env.step(Action(action_type="send_message", message="The refund cannot be approved."))
         second = env.last_customer_reply
         assert "begging" in second.lower() or "birthday" in second.lower()
+
+
+class TestDuplicateCallPenalty:
+    def test_duplicate_get_no_reward(self):
+        env = SupportEnvironment()
+        env.reset("easy", seed=42)
+        action = Action(action_type="call_api", method="GET", endpoint="/policies")
+        _, r1, _, _ = env.step(action)
+        _, r2, _, _ = env.step(action)
+        assert r1.value > 0
+        assert r2.value == 0.0
+        assert "Duplicate" in r2.reason
+
+    def test_duplicate_post_still_penalised(self):
+        env = SupportEnvironment()
+        env.reset("medium", seed=42)
+        action = Action(action_type="call_api", method="POST", endpoint="/refunds",
+                        payload={"order_id": "O-200", "amount": 120.0})
+        env.step(action)
+        action2 = Action(action_type="call_api", method="POST", endpoint="/refunds",
+                         payload={"order_id": "O-200", "amount": 120.0})
+        _, r2, _, _ = env.step(action2)
+        assert r2.value < 0  # double-refund still penalised
+
+    def test_different_gets_both_rewarded(self):
+        env = SupportEnvironment()
+        env.reset("easy", seed=42)
+        _, r1, _, _ = env.step(Action(action_type="call_api", method="GET", endpoint="/policies"))
+        _, r2, _, _ = env.step(Action(action_type="call_api", method="GET", endpoint="/knowledge_base?q=refund"))
+        assert r1.value > 0
+        assert r2.value > 0
+
+
+class TestSatisfactionInGrader:
+    def test_satisfaction_appears_in_breakdown(self):
+        env = SupportEnvironment()
+        env.reset("easy", seed=42)
+        env.step(Action(action_type="send_message", message="I'm sorry for the inconvenience."))
+        env.step(Action(action_type="close_ticket", resolution="Done.", resolution_code="info_provided"))
+        result = env.grade()
+        assert "satisfaction" in result["breakdown"]
+        assert result["breakdown"]["satisfaction"] > 0
+
+    def test_low_satisfaction_reduces_score(self):
+        env = SupportEnvironment()
+        env.reset("easy", seed=42)
+        # Close without any messages — satisfaction drops
+        env.step(Action(action_type="close_ticket", resolution="Done.", resolution_code="info_provided"))
+        result = env.grade()
+        assert result["breakdown"]["satisfaction"] < 0.10
 
 
 class TestCustomerSatisfaction:
