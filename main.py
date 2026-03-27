@@ -1,6 +1,8 @@
+import logging
 import os
 import threading
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -18,10 +20,24 @@ from models import Action, Observation, Reward, Info
 
 load_dotenv(Path(__file__).with_name(".env.local"), override=False)
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("openenv")
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    logger.info("OpenEnv CustomerServiceAgent v1.0.0 started")
+    logger.info("Active sessions: %d  OPENAI_API_KEY set: %s", len(_session_envs), bool(os.environ.get("OPENAI_API_KEY")))
+    yield
+
 app = FastAPI(
     title="Customer Service Agent OpenEnv",
     description="A real-world OpenEnv environment simulating customer service ticket resolution.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 SESSION_COOKIE_NAME = "openenv_session_id"
@@ -68,6 +84,18 @@ async def step(action: Action, request: Request):
     session_id = request.cookies.get(SESSION_COOKIE_NAME, _DEFAULT_SESSION_ID)
     env = _get_env_for_session(session_id)
     obs, reward, done, info = env.step(action)
+    detail = ""
+    if action.action_type == "call_api":
+        detail = f" {action.method} {action.endpoint}"
+    elif action.action_type == "send_message":
+        detail = f" \"{(action.message or '')[:60]}...\""
+    elif action.action_type == "close_ticket":
+        detail = f" code={action.resolution_code}"
+    logger.info(
+        "STEP  session=%s  ticket=%s  action=%s%s  reward=%+.2f  done=%s",
+        session_id[:8], env.ticket.get("id", "?"), action.action_type, detail,
+        reward.value, done,
+    )
     return StepResponse(observation=obs, reward=reward, done=done, info=info)
 
 
@@ -83,8 +111,15 @@ async def reset(
     session_id, is_new = _get_or_create_session_id(request)
     if is_new:
         response.set_cookie(SESSION_COOKIE_NAME, session_id, httponly=True)
+        logger.info("SESSION created session=%s", session_id[:8])
     env = _get_env_for_session(session_id)
-    return env.reset(task_id=task_id, seed=seed)
+    obs = env.reset(task_id=task_id, seed=seed)
+    logger.info(
+        "RESET session=%s  task=%s  seed=%s  ticket=%s  variant=%s  customer=%s",
+        session_id[:8], task_id, seed, obs.ticket_id,
+        env.variant.get("id", "?"), obs.customer_name,
+    )
+    return obs
 
 
 @app.get("/state", response_model=Observation)
@@ -160,7 +195,13 @@ async def get_grader(request: Request):
     """Return grader score for the current (completed) episode."""
     session_id = request.cookies.get(SESSION_COOKIE_NAME, _DEFAULT_SESSION_ID)
     env = _get_env_for_session(session_id)
-    return env.grade()
+    result = env.grade()
+    logger.info(
+        "GRADE session=%s  task=%s  score=%.4f  breakdown=%s",
+        session_id[:8], result.get("task", "?"), result.get("score", 0.0),
+        result.get("breakdown", {}),
+    )
+    return result
 
 
 @app.post("/baseline")
@@ -170,18 +211,25 @@ async def run_baseline_endpoint():
     if not api_key:
         raise HTTPException(status_code=400, detail="OPENAI_API_KEY not set")
 
+    model = os.getenv("OPENAI_MODEL", "gpt-4o")
+    seed = int(os.getenv("OPENAI_BASELINE_SEED", "42"))
+    logger.info("BASELINE started  model=%s  seed=%d", model, seed)
     client = create_openai_client(api_key)
     baseline_env = LocalEnvironmentClient(SupportEnvironment())
     try:
         result = execute_baseline(
             llm_client=client,
             env_client=baseline_env,
-            model=os.getenv("OPENAI_MODEL", "gpt-4o"),
-            seed=int(os.getenv("OPENAI_BASELINE_SEED", "42")),
+            model=model,
+            seed=seed,
             fail_on_error=True,
         )
+        logger.info("BASELINE complete  avg_score=%.4f  results=%s", result["average_score"], {
+            t: r.get("score", 0.0) for t, r in result.get("baseline_results", {}).items()
+        })
         return result
     except RuntimeError as exc:
+        logger.error("BASELINE failed: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
