@@ -85,8 +85,18 @@ Agent must find order details and relay tracking info. Scored on: data retrieval
 ### Medium — Standard Refund
 Agent checks policies, verifies order eligibility, processes the correct refund amount. Scored on: policy check, correct refund amount, data retrieval, communication, resolution code.
 
-### Hard — Fraud Detection / Partial Refund
-Complex scenarios: fraud-flagged customers (deny refund), partial refunds past the return window, or escalation needs. Scored on: order review, customer profile check, correct denial/partial refund, policy & KB usage, communication, resolution code.
+### Hard — Fraud Detection / Partial Refund / Adversarial Customers
+Complex scenarios with **adversarial customer personalities** that test multi-turn reasoning:
+
+| Personality | Behavior |
+|---|---|
+| **Aggressive** | Threatens negative reviews and demands managers on denial |
+| **Persistent** | Rejects partial refunds and repeats full-refund demands |
+| **Manipulative** | Uses emotional appeals and claims of innocence when fraud-flagged |
+| **Social Engineer** | Impersonates management, fabricates override codes, pressures agent |
+| **Contradictory** | Changes their story across turns (damaged → wrong item → both) |
+
+**Research gate**: The core decision score (denial or refund accuracy, worth 0.35) is **gated behind policy + KB consultation**. Without checking `/policies` and `/knowledge_base`, max hard score is 0.40. Scored on: order review, customer profile check, policy check, KB check, correct denial/partial refund, communication, resolution code.
 
 ---
 
@@ -173,7 +183,8 @@ selene/
 ├── environment.py       # Core environment logic, ticket variants, grader
 ├── models.py            # Pydantic models (Action, Observation, Reward, Info)
 ├── baseline.py          # OpenAI-powered baseline agent
-├── test_environment.py  # pytest test suite
+├── test_environment.py  # Unit tests for environment logic
+├── test_api.py          # HTTP integration tests for FastAPI endpoints
 ├── openenv.yaml         # OpenEnv spec metadata
 ├── pyproject.toml       # Multi-mode packaging metadata
 ├── uv.lock              # Lockfile for OpenEnv validation
@@ -184,5 +195,5 @@ selene/
 
 ## Verification
 
-- `python -m pytest test_environment.py -v` -> 22 tests passed
+- `python -m pytest test_environment.py test_api.py -v` -> 48 tests passed (30 unit + 18 HTTP integration)
 - `openenv validate` -> passed

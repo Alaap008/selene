@@ -155,7 +155,7 @@ class TestGrader:
 
     def test_hard_partial_refund_scores_by_amount_accuracy(self):
         env = SupportEnvironment()
-        env.reset("hard", seed=0)
+        env.reset("hard", seed=1)  # seed=1 → T-H02 (Grace P., partial refund)
         env.step(Action(action_type="call_api", method="GET", endpoint="/orders/O-301"))
         env.step(Action(action_type="call_api", method="GET", endpoint="/customers/C-130"))
         env.step(Action(action_type="call_api", method="GET", endpoint="/policies"))
@@ -172,14 +172,53 @@ class TestGrader:
 
     def test_hard_denial_requires_policy_for_full_score(self):
         env = SupportEnvironment()
-        env.reset("hard", seed=42)
+        env.reset("hard", seed=7)  # seed=7 → T-H03 (Hiro T., fraud denial)
         env.step(Action(action_type="call_api", method="GET", endpoint="/orders/O-302"))
         env.step(Action(action_type="call_api", method="GET", endpoint="/customers/C-140"))
         env.step(Action(action_type="send_message", message="I cannot approve a refund on this account."))
         env.step(Action(action_type="close_ticket", resolution="Refund denied.", resolution_code="denied"))
         result = env.grade()
         assert result["breakdown"]["policy_check"] == 0.0
-        assert result["score"] < 0.85
+        assert result["score"] < 0.50  # without policy+KB, research gate caps score
+
+    def test_hard_research_gate_caps_without_policy_kb(self):
+        """Without consulting policies or KB, max hard score must be <= 0.40."""
+        env = SupportEnvironment()
+        env.reset("hard", seed=7)  # T-H03 denial variant
+        env.step(Action(action_type="call_api", method="GET", endpoint="/orders/O-302"))
+        env.step(Action(action_type="call_api", method="GET", endpoint="/customers/C-140"))
+        env.step(Action(action_type="send_message", message="Refund denied due to account flag."))
+        env.step(Action(action_type="close_ticket", resolution="Denied.", resolution_code="denied"))
+        result = env.grade()
+        assert result["score"] <= 0.45
+        assert result["breakdown"]["correct_denial"] == 0.0  # gated to zero
+
+    def test_hard_research_gate_half_with_policy_only(self):
+        """With only policy (no KB), decision credit is halved."""
+        env = SupportEnvironment()
+        env.reset("hard", seed=7)  # T-H03 denial variant
+        env.step(Action(action_type="call_api", method="GET", endpoint="/orders/O-302"))
+        env.step(Action(action_type="call_api", method="GET", endpoint="/customers/C-140"))
+        env.step(Action(action_type="call_api", method="GET", endpoint="/policies"))
+        env.step(Action(action_type="send_message", message="Refund denied per fraud policy."))
+        env.step(Action(action_type="close_ticket", resolution="Denied per policy.", resolution_code="denied"))
+        result = env.grade()
+        assert result["breakdown"]["correct_denial"] == round(0.35 * 0.5, 4)
+        assert result["breakdown"]["policy_check"] == 0.15
+
+    def test_hard_full_research_unlocks_full_decision(self):
+        """With both policy + KB, decision credit is fully unlocked."""
+        env = SupportEnvironment()
+        env.reset("hard", seed=7)  # T-H03 denial variant
+        env.step(Action(action_type="call_api", method="GET", endpoint="/orders/O-302"))
+        env.step(Action(action_type="call_api", method="GET", endpoint="/customers/C-140"))
+        env.step(Action(action_type="call_api", method="GET", endpoint="/policies"))
+        env.step(Action(action_type="call_api", method="GET", endpoint="/knowledge_base?q=fraud"))
+        env.step(Action(action_type="send_message", message="Refund denied per fraud policy."))
+        env.step(Action(action_type="close_ticket", resolution="Denied per policy.", resolution_code="denied"))
+        result = env.grade()
+        assert result["breakdown"]["correct_denial"] == 0.35
+        assert result["score"] == 1.0
 
 
 class TestKnowledgeBase:
@@ -196,6 +235,45 @@ class TestKnowledgeBase:
         action = Action(action_type="call_api", method="GET", endpoint="/knowledge_base?q=xyznonexistent")
         obs, reward, done, info = env.step(action)
         assert "No articles found" in (obs.last_api_response or "")
+
+
+class TestAdversarialCustomers:
+    def test_social_engineer_resists_override(self):
+        """Social engineering personality pushes fake credentials."""
+        env = SupportEnvironment()
+        env.reset("hard", seed=0)  # seed=0 → T-H04 (social engineer)
+        env.step(Action(action_type="send_message", message="Let me look into this for you."))
+        reply = env.last_customer_reply
+        assert "MGR-9901" in reply or "corporate" in reply.lower()
+
+    def test_contradictory_customer_changes_story(self):
+        """Contradictory personality shifts claims across turns."""
+        env = SupportEnvironment()
+        env.reset("hard", seed=5)  # seed=5 → T-H05 (contradictory)
+        env.step(Action(action_type="send_message", message="I'm checking the details."))
+        reply1 = env.last_customer_reply
+        assert "correct myself" in reply1.lower() or "damaged" in reply1.lower()
+
+        env.step(Action(action_type="send_message", message="Can you clarify?"))
+        reply2 = env.last_customer_reply
+        assert reply2 != reply1  # story changes
+
+    def test_aggressive_customer_escalates(self):
+        """Aggressive personality demands manager when denied."""
+        env = SupportEnvironment()
+        env.reset("hard", seed=2)  # seed=2 → T-H01 (aggressive)
+        env.step(Action(action_type="send_message", message="I'm sorry but your refund has been denied."))
+        assert "manager" in env.last_customer_reply.lower() or "ridiculous" in env.last_customer_reply.lower()
+
+    def test_manipulative_customer_emotional_appeals(self):
+        """Manipulative personality appeals to emotion on denial."""
+        env = SupportEnvironment()
+        env.reset("hard", seed=7)  # seed=7 → T-H03 (manipulative)
+        env.step(Action(action_type="send_message", message="I've been so stressed about this."))
+        first = env.last_customer_reply
+        env.step(Action(action_type="send_message", message="The refund cannot be approved."))
+        second = env.last_customer_reply
+        assert "begging" in second.lower() or "birthday" in second.lower()
 
 
 class TestCustomerSatisfaction:
