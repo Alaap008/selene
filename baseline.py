@@ -52,6 +52,7 @@ Example: {"action_type": "close_ticket", "resolution": "Order O-100 is shipped w
 - If a customer is fraud-flagged, DENY the refund and explain politely.
 - Use the correct resolution_code when closing.
 - Be efficient — avoid unnecessary steps.
+- Use reward feedback from the previous step to improve your next action.
 """
 
 
@@ -110,10 +111,35 @@ class LocalEnvironmentClient:
         return Action(**action)
 
 
-def get_action_from_llm(client, obs: dict, messages: list, model: str, seed: int) -> dict:
-    """Ask the LLM for the next action given the current observation."""
+def get_action_from_llm(
+    client,
+    obs: dict,
+    messages: list,
+    model: str,
+    seed: int,
+    last_reward: dict | None = None,
+) -> dict:
+    """Ask the LLM for the next action given the current observation and reward feedback."""
     obs_str = json.dumps(obs, indent=2)
-    messages.append({"role": "user", "content": f"Current Observation:\n```json\n{obs_str}\n```\nWhat is your next action? Output ONLY the JSON action object."})
+    feedback_block = ""
+    if last_reward is not None:
+        reward_value = last_reward.get("value", 0.0)
+        reward_reason = last_reward.get("reason", "")
+        feedback_block = (
+            "Feedback from your previous action:\n"
+            f"- reward: {reward_value:+.4f}\n"
+            f"- reason: {reward_reason}\n\n"
+        )
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                f"{feedback_block}"
+                f"Current Observation:\n```json\n{obs_str}\n```\n"
+                "What is your next action? Output ONLY the JSON action object."
+            ),
+        }
+    )
 
     try:
         response = client.chat.completions.create(
@@ -146,10 +172,18 @@ def run_task(env_client, llm_client, task_id: str, model: str, seed: int = DEFAU
     step_count = 0
     max_steps = 15  # leave some buffer before env's 20-step hard limit
     cumulative_reward = 0.0
+    last_reward = None
 
     while not done and step_count < max_steps:
         step_count += 1
-        action_dict = get_action_from_llm(llm_client, obs, messages, model=model, seed=seed)
+        action_dict = get_action_from_llm(
+            llm_client,
+            obs,
+            messages,
+            model=model,
+            seed=seed,
+            last_reward=last_reward,
+        )
         print(f"  Step {step_count}: {action_dict.get('action_type', '?')} ", end="")
 
         try:
@@ -158,6 +192,7 @@ def run_task(env_client, llm_client, task_id: str, model: str, seed: int = DEFAU
             reward = step_data["reward"]
             done = step_data["done"]
             cumulative_reward += reward["value"]
+            last_reward = reward
             print(f"— reward: {reward['value']:+.4f} ({reward['reason']})")
 
         except Exception as e:
