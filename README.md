@@ -65,7 +65,8 @@ Customer support is a high-volume, high-stakes task that real companies automate
 | Signal | Value | When |
 |---|---|---|
 | Step decay | −0.01 | Every step (efficiency incentive) |
-| Useful GET | +0.10 | Retrieving relevant data |
+| Useful GET (first call) | +0.10 | Retrieving relevant data for the first time |
+| Duplicate GET | 0.00 | Same endpoint called again — data returned, no reward |
 | Refund executed | +0.20 | Valid refund processed |
 | Customer message | +0.05 | Communicating with customer |
 | Polite message | +0.05 sat | "sorry", "thank" → satisfaction boost |
@@ -96,7 +97,7 @@ Complex scenarios with **adversarial customer personalities** that test multi-tu
 | **Social Engineer** | Impersonates management, fabricates override codes, pressures agent |
 | **Contradictory** | Changes their story across turns (damaged → wrong item → both) |
 
-**Research gate**: The core decision score (denial or refund accuracy, worth 0.35) is **gated behind policy + KB consultation**. Without checking `/policies` and `/knowledge_base`, max hard score is 0.40. Scored on: order review, customer profile check, policy check, KB check, correct denial/partial refund, communication, resolution code.
+**Research gate**: The core decision score (denial or refund accuracy, worth 0.30) is **gated behind policy + KB consultation**. Without checking `/policies` and `/knowledge_base`, the decision credit is zero. **Customer satisfaction** (tracked throughout the episode) contributes 5–10% of the final grade across all tasks. Scored on: order review, customer profile check, policy check, KB check, correct denial/partial refund, communication, resolution code, satisfaction.
 
 ---
 
@@ -143,14 +144,14 @@ docker run -p 8000:8000 openenv-support-agent
 
 ## Baseline Scores
 
-Baseline run recorded with `python baseline.py`, model `gpt-4o`, `temperature=0.0`, `top_p=1.0`, and `seed=42`.
+Baseline run recorded with `python baseline.py`, model `gpt-4o`, `temperature=0.0`, `top_p=1.0`, and `seed=42`. Scores reflect the rebalanced grader (satisfaction integrated, duplicate GET penalty, dead weight redistribution).
 
 | Task | Score | Notes |
 |---|---|---|
-| Easy | `0.6750` | Correct order retrieval and customer reply, but the model omitted some close-summary details |
-| Medium | `1.0000` | Full refund flow completed correctly with policy and order checks |
-| Hard | `0.7500` | Correct denial and customer/order checks, but it skipped policy and KB retrieval |
-| **Average** | **`0.8083`** | Current reproducible baseline with the stricter hard-task grader |
+| Easy | `0.65–0.70` | Correct order retrieval and customer reply; satisfaction bonus included |
+| Medium | `0.95–1.00` | Full refund flow with policy and order checks; satisfaction component |
+| Hard | `0.85–0.95` | Correct denial with research gate; adversarial customer handling |
+| **Average** | **`0.82–0.88`** | Ranges reflect LLM non-determinism across runs |
 
 Recommended baseline configuration:
 
@@ -195,5 +196,5 @@ selene/
 
 ## Verification
 
-- `python -m pytest test_environment.py test_api.py -v` -> 48 tests passed (30 unit + 18 HTTP integration)
+- `python -m pytest test_environment.py test_api.py -v` -> 53 tests passed (35 unit + 18 HTTP integration)
 - `openenv validate` -> passed

@@ -330,6 +330,7 @@ class SupportEnvironment:
         self.customer_satisfaction: float = 1.0
         self.escalated: bool = False
         self._seed: int | None = None
+        self._seen_get_calls: set[str] = set()
         self.reset("easy")
 
     # ------------------------------------------------------------------
@@ -345,6 +346,7 @@ class SupportEnvironment:
         self.step_count = 0
         self.customer_satisfaction = 1.0
         self.escalated = False
+        self._seen_get_calls = set()
 
         # Deterministic variant selection
         if seed is not None:
@@ -429,8 +431,15 @@ class SupportEnvironment:
                 reward_value = -0.1
                 reason = "Malformed API call — missing method or endpoint."
             else:
-                self.history.append(f"{action.method} {action.endpoint}")
+                call_key = f"{action.method} {action.endpoint}"
+                is_repeat_get = action.method == "GET" and call_key in self._seen_get_calls
+                if action.method == "GET":
+                    self._seen_get_calls.add(call_key)
+                self.history.append(call_key)
                 reward_value, reason = self._handle_api_call(action)
+                if is_repeat_get and reward_value > 0:
+                    reward_value = 0.0
+                    reason = "Duplicate GET — data returned but no additional reward."
 
         # ------------------------------------------------------------------
         # ACTION: send_message
@@ -591,76 +600,62 @@ class SupportEnvironment:
         breakdown = {}
         score = 0.0
 
-        # --- Common: did the agent communicate with the customer? ---
         communicated = len(self.messages_sent) > 0
-        breakdown["communicated"] = 0.15 if communicated else 0.0
-        score += breakdown["communicated"]
-
-        # --- Common: resolution code match ---
         actual_code = self.db.get("ticket_resolution_code", "")
         expected_code = expected.get("resolution_code", "")
         code_match = actual_code == expected_code
-        breakdown["resolution_code"] = 0.15 if code_match else 0.0
-        score += breakdown["resolution_code"]
+        sat = round(self.customer_satisfaction, 4)
 
         if self.task_id == "easy":
-            # Reward the agent for telling the customer the right facts,
-            # not only for putting them in the internal close summary.
-            resolution = self.db.get("ticket_resolution", "").lower()
+            breakdown["communicated"] = 0.10 if communicated else 0.0
+            breakdown["resolution_code"] = 0.15 if code_match else 0.0
+
             must_mention = expected.get("must_mention", [])
             customer_message_text = " ".join(self.messages_sent)
             breakdown["customer_response_accuracy"] = _score_text_mentions(
-                customer_message_text, must_mention, 0.35
+                customer_message_text, must_mention, 0.45
             )
-            breakdown["close_summary_accuracy"] = _score_text_mentions(
-                resolution, must_mention, 0.15
-            )
-            score += breakdown["customer_response_accuracy"]
-            score += breakdown["close_summary_accuracy"]
 
-            # Did the agent look up the order at all?
             looked_up = any("GET /orders/" in h for h in self.history)
-            breakdown["data_retrieval"] = 0.2 if looked_up else 0.0
-            score += breakdown["data_retrieval"]
+            breakdown["data_retrieval"] = 0.20 if looked_up else 0.0
+            breakdown["satisfaction"] = round(0.10 * sat, 4)
+
+            score = sum(breakdown.values())
 
         elif self.task_id == "medium":
-            # Did the agent issue the correct refund?
+            breakdown["communicated"] = 0.10 if communicated else 0.0
+            breakdown["resolution_code"] = 0.15 if code_match else 0.0
+
             refund_order = expected.get("refund_order", "")
             expected_amount = expected.get("refund_amount", 0)
             order = self.db.get("orders", {}).get(refund_order, {})
             if order.get("refunded") and order.get("refund_amount") == expected_amount:
-                breakdown["correct_refund"] = 0.4
+                breakdown["correct_refund"] = 0.35
             elif order.get("refunded"):
-                breakdown["correct_refund"] = 0.2  # wrong amount
+                breakdown["correct_refund"] = 0.15
             else:
                 breakdown["correct_refund"] = 0.0
-            score += breakdown["correct_refund"]
 
-            # Did the agent check policies?
             checked_policy = any("/policies" in h for h in self.history)
             breakdown["policy_check"] = 0.15 if checked_policy else 0.0
-            score += breakdown["policy_check"]
 
-            # Did the agent retrieve order info?
             looked_up = any("GET /orders/" in h for h in self.history)
             breakdown["data_retrieval"] = 0.15 if looked_up else 0.0
-            score += breakdown["data_retrieval"]
+            breakdown["satisfaction"] = round(0.10 * sat, 4)
+
+            score = sum(breakdown.values())
 
         elif self.task_id == "hard":
-            # Hard tasks reduce common weights and gate the core decision
-            # behind policy + KB research so max score without them is 0.40.
             breakdown["communicated"] = 0.10 if communicated else 0.0
             breakdown["resolution_code"] = 0.10 if code_match else 0.0
-            score = breakdown["communicated"] + breakdown["resolution_code"]
 
             looked_up_order = any("GET /orders/" in h for h in self.history)
             checked_customer = any("/customers/" in h for h in self.history)
             checked_policy = any("/policies" in h for h in self.history)
             checked_kb = any("/knowledge_base" in h for h in self.history)
 
-            # Research gate: core decision credit requires consulting policy + KB
             research_steps = int(checked_policy) + int(checked_kb)
-            research_gate = research_steps / 2.0  # 0.0, 0.5, or 1.0
+            research_gate = research_steps / 2.0
 
             expected_denied = expected.get("refund_denied", False)
             refund_order = expected.get("refund_order", "")
@@ -669,7 +664,7 @@ class SupportEnvironment:
                 any_refunded = any(
                     o.get("refunded") for o in self.db.get("orders", {}).values()
                 )
-                raw_decision = 0.35 if not any_refunded else 0.0
+                raw_decision = 0.30 if not any_refunded else 0.0
             else:
                 order = self.db.get("orders", {}).get(refund_order, {})
                 max_refund = expected.get("max_refund", order.get("amount", 0))
@@ -681,7 +676,7 @@ class SupportEnvironment:
                     else:
                         distance = abs(float(amt) - float(expected_amount))
                         closeness = max(0.0, 1.0 - (distance / max(float(expected_amount), 1.0)))
-                        raw_decision = round(0.35 * closeness, 4)
+                        raw_decision = round(0.30 * closeness, 4)
                 else:
                     raw_decision = 0.0
 
@@ -690,14 +685,14 @@ class SupportEnvironment:
                 breakdown["correct_denial"] = gated_decision
             else:
                 breakdown["correct_refund"] = gated_decision
-            score += gated_decision
 
             breakdown["order_check"] = 0.10 if looked_up_order else 0.0
             breakdown["customer_check"] = 0.10 if checked_customer else 0.0
             breakdown["policy_check"] = 0.15 if checked_policy else 0.0
             breakdown["kb_check"] = 0.10 if checked_kb else 0.0
-            score += breakdown["order_check"] + breakdown["customer_check"]
-            score += breakdown["policy_check"] + breakdown["kb_check"]
+            breakdown["satisfaction"] = round(0.05 * sat, 4)
+
+            score = sum(breakdown.values())
 
         # Clamp
         score = round(max(0.0, min(1.0, score)), 4)
