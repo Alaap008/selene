@@ -85,8 +85,18 @@ Agent must find order details and relay tracking info. Scored on: data retrieval
 ### Medium — Standard Refund
 Agent checks policies, verifies order eligibility, processes the correct refund amount. Scored on: policy check, correct refund amount, data retrieval, communication, resolution code.
 
-### Hard — Fraud Detection / Partial Refund
-Complex scenarios: fraud-flagged customers (deny refund), partial refunds past the return window, or escalation needs. Scored on: customer profile check, correct denial/partial refund, policy & KB usage, communication, resolution code.
+### Hard — Fraud Detection / Partial Refund / Adversarial Customers
+Complex scenarios with **adversarial customer personalities** that test multi-turn reasoning:
+
+| Personality | Behavior |
+|---|---|
+| **Aggressive** | Threatens negative reviews and demands managers on denial |
+| **Persistent** | Rejects partial refunds and repeats full-refund demands |
+| **Manipulative** | Uses emotional appeals and claims of innocence when fraud-flagged |
+| **Social Engineer** | Impersonates management, fabricates override codes, pressures agent |
+| **Contradictory** | Changes their story across turns (damaged → wrong item → both) |
+
+**Research gate**: The core decision score (denial or refund accuracy, worth 0.35) is **gated behind policy + KB consultation**. Without checking `/policies` and `/knowledge_base`, max hard score is 0.40. Scored on: order review, customer profile check, policy check, KB check, correct denial/partial refund, communication, resolution code.
 
 ---
 
@@ -133,7 +143,14 @@ docker run -p 8000:8000 openenv-support-agent
 
 ## Baseline Scores
 
-Exact baseline scores are produced by `python baseline.py` or `POST /baseline` and depend on the deployed OpenAI model revision. This repository is configured to make those runs deterministic for a fixed model name and seed, but no API key was available in this verification run, so no fabricated scores are listed here.
+Baseline run recorded with `python baseline.py`, model `gpt-4o`, `temperature=0.0`, `top_p=1.0`, and `seed=42`.
+
+| Task | Score | Notes |
+|---|---|---|
+| Easy | `0.6750` | Correct order retrieval and customer reply, but the model omitted some close-summary details |
+| Medium | `1.0000` | Full refund flow completed correctly with policy and order checks |
+| Hard | `0.7500` | Correct denial and customer/order checks, but it skipped policy and KB retrieval |
+| **Average** | **`0.8083`** | Current reproducible baseline with the stricter hard-task grader |
 
 Recommended baseline configuration:
 
@@ -143,6 +160,8 @@ Recommended baseline configuration:
 | Temperature | `0.0` |
 | Top-p | `1.0` |
 | Seed | `42` |
+
+If the OpenAI API is unavailable, `baseline.py` now exits non-zero instead of silently fabricating actions. The deployed Hugging Face Space should expose `/baseline` once `OPENAI_API_KEY` is configured as a Space secret.
 
 ---
 
@@ -164,7 +183,8 @@ selene/
 ├── environment.py       # Core environment logic, ticket variants, grader
 ├── models.py            # Pydantic models (Action, Observation, Reward, Info)
 ├── baseline.py          # OpenAI-powered baseline agent
-├── test_environment.py  # pytest test suite
+├── test_environment.py  # Unit tests for environment logic
+├── test_api.py          # HTTP integration tests for FastAPI endpoints
 ├── openenv.yaml         # OpenEnv spec metadata
 ├── pyproject.toml       # Multi-mode packaging metadata
 ├── uv.lock              # Lockfile for OpenEnv validation
@@ -175,5 +195,5 @@ selene/
 
 ## Verification
 
-- `python -m pytest test_environment.py -v` -> 21 tests passed
+- `python -m pytest test_environment.py test_api.py -v` -> 48 tests passed (30 unit + 18 HTTP integration)
 - `openenv validate` -> passed
