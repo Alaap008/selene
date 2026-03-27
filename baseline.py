@@ -62,6 +62,47 @@ def create_openai_client(api_key: str):
     return OpenAI(api_key=api_key)
 
 
+def _extract_progress_signals(task_id: str, obs: dict) -> dict:
+    """Build deterministic progress signals from observation/action history."""
+    action_history = obs.get("action_history", [])
+    messages_sent = obs.get("messages_sent", [])
+
+    checked_order = any("GET /orders/" in entry for entry in action_history)
+    checked_customer = any("/customers/" in entry for entry in action_history)
+    checked_policy = any("/policies" in entry for entry in action_history)
+    checked_kb = any("/knowledge_base" in entry for entry in action_history)
+    issued_refund = any("POST /refunds" in entry for entry in action_history)
+    escalated = any("POST /escalate" in entry for entry in action_history)
+    communicated = len(messages_sent) > 0
+
+    progress = {
+        "communicated": int(communicated),
+        "order_check": int(checked_order),
+        "customer_check": int(checked_customer),
+        "policy_check": int(checked_policy),
+        "kb_check": int(checked_kb),
+        "refund_attempted": int(issued_refund),
+        "escalated": int(escalated),
+    }
+
+    if task_id == "hard":
+        # Hard-task decision credit is gated behind policy + KB checks.
+        progress["hard_research_gate_unlocked"] = int(checked_policy and checked_kb)
+
+    return progress
+
+
+def _missing_checklist(task_id: str, progress: dict) -> list[str]:
+    """Return unfinished high-impact checklist items for the task."""
+    if task_id == "easy":
+        required = ["order_check", "communicated"]
+    elif task_id == "medium":
+        required = ["order_check", "policy_check", "refund_attempted", "communicated"]
+    else:
+        required = ["order_check", "customer_check", "policy_check", "kb_check", "communicated"]
+    return [key for key in required if not progress.get(key)]
+
+
 class HttpEnvironmentClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
@@ -117,6 +158,7 @@ def get_action_from_llm(
     messages: list,
     model: str,
     seed: int,
+    task_id: str,
     last_reward: dict | None = None,
 ) -> dict:
     """Ask the LLM for the next action given the current observation and reward feedback."""
@@ -130,11 +172,25 @@ def get_action_from_llm(
             f"- reward: {reward_value:+.4f}\n"
             f"- reason: {reward_reason}\n\n"
         )
+
+    progress = _extract_progress_signals(task_id=task_id, obs=obs)
+    missing = _missing_checklist(task_id=task_id, progress=progress)
+    scoring_block = (
+        "Scoring Pattern Progress (0/1 checks):\n"
+        f"{json.dumps(progress, separators=(',', ':'))}\n"
+        f"Missing high-impact checks: {', '.join(missing) if missing else 'none'}\n"
+    )
+    if task_id == "hard":
+        scoring_block += (
+            "Hard-task gate: core decision credit is locked until BOTH "
+            "/policies and /knowledge_base are checked.\n"
+        )
     messages.append(
         {
             "role": "user",
             "content": (
                 f"{feedback_block}"
+                f"{scoring_block}\n"
                 f"Current Observation:\n```json\n{obs_str}\n```\n"
                 "What is your next action? Output ONLY the JSON action object."
             ),
@@ -182,6 +238,7 @@ def run_task(env_client, llm_client, task_id: str, model: str, seed: int = DEFAU
             messages,
             model=model,
             seed=seed,
+            task_id=task_id,
             last_reward=last_reward,
         )
         print(f"  Step {step_count}: {action_dict.get('action_type', '?')} ", end="")
