@@ -200,5 +200,5 @@ selene/
 
 ## Verification
 
-- `python -m pytest test_environment.py test_api.py -v` -> 53 tests passed (35 unit + 18 HTTP integration)
+- `python -m pytest test_environment.py test_api.py -v` -> 55 tests passed (37 unit + 18 HTTP integration)
 - `openenv validate` -> passed
