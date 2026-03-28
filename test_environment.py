@@ -341,3 +341,26 @@ class TestCustomerSatisfaction:
         action = Action(action_type="close_ticket", resolution="Done.", resolution_code="resolved")
         obs, reward, done, info = env.step(action)
         assert info.customer_satisfaction < 1.0
+
+
+class TestSentimentAnalysis:
+    def test_send_message_populates_sentiment_labels(self):
+        env = SupportEnvironment()
+        env.reset("easy", seed=42)
+        obs, reward, done, info = env.step(
+            Action(action_type="send_message", message="Thanks for your patience, happy to help.")
+        )
+        assert obs.last_agent_sentiment in {"positive", "neutral", "negative"}
+        assert obs.last_customer_sentiment in {"positive", "neutral", "negative"}
+        assert info.metrics.get("last_agent_sentiment") == obs.last_agent_sentiment
+        assert info.metrics.get("last_customer_sentiment") == obs.last_customer_sentiment
+
+    def test_negative_agent_message_can_lower_satisfaction(self):
+        env = SupportEnvironment()
+        env.reset("easy", seed=42)
+        baseline_sat = env.customer_satisfaction
+        obs, reward, done, info = env.step(
+            Action(action_type="send_message", message="This is unacceptable and I cannot help.")
+        )
+        assert obs.last_agent_sentiment == "negative"
+        assert info.customer_satisfaction < baseline_sat

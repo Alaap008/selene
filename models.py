@@ -69,6 +69,12 @@ class Observation(BaseModel):
     last_customer_reply: Optional[str] = Field(
         None, description="The customer's latest reply after agent sent a message."
     )
+    last_customer_sentiment: Optional[Literal["positive", "neutral", "negative"]] = Field(
+        None, description="Sentiment label inferred from the latest customer reply."
+    )
+    last_agent_sentiment: Optional[Literal["positive", "neutral", "negative"]] = Field(
+        None, description="Sentiment label inferred from the latest agent message."
+    )
     messages_sent: List[str] = Field(
         default_factory=list, description="All messages the agent has sent to the customer."
     )
@@ -90,4 +96,7 @@ class Info(BaseModel):
     customer_satisfaction: float = Field(
         1.0, description="Customer satisfaction score (0.0–1.0), degrades with bad interactions."
     )
-    metrics: Dict[str, Any] = Field(default_factory=dict, description="Debug metrics.")
+    metrics: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Debug metrics such as per-turn sentiment labels.",
+    )

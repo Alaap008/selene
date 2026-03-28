@@ -224,6 +224,44 @@ KNOWLEDGE_BASE = [
 ]
 
 
+POSITIVE_SENTIMENT_TOKENS = {
+    "appreciate", "awesome", "excellent", "glad", "good", "great", "happy",
+    "helpful", "kind", "perfect", "please", "resolved", "sorry", "thank",
+    "thanks", "understand",
+}
+
+NEGATIVE_SENTIMENT_TOKENS = {
+    "angry", "annoyed", "awful", "bad",
+    "disappointed", "frustrated", "hate", "horrible", "issue", "ridiculous",
+    "terrible", "unacceptable", "upset", "worst",
+}
+
+
+def _analyze_sentiment(text: str) -> dict[str, float | str]:
+    """Very lightweight rule-based sentiment over message text."""
+    if not text or not text.strip():
+        return {"label": "neutral", "score": 0.0}
+
+    tokens = [token.strip(".,!?;:\"'()[]{}").lower() for token in text.split()]
+    tokens = [token for token in tokens if token]
+    if not tokens:
+        return {"label": "neutral", "score": 0.0}
+
+    positives = sum(1 for token in tokens if token in POSITIVE_SENTIMENT_TOKENS)
+    negatives = sum(1 for token in tokens if token in NEGATIVE_SENTIMENT_TOKENS)
+    raw = positives - negatives
+    normalized = max(-1.0, min(1.0, raw / max(len(tokens), 1)))
+
+    if normalized >= 0.1:
+        label = "positive"
+    elif normalized <= -0.1:
+        label = "negative"
+    else:
+        label = "neutral"
+
+    return {"label": label, "score": round(normalized, 4)}
+
+
 def _score_text_mentions(text: str, required_phrases: list[str], weight: float) -> float:
     """Score how many required phrases appear in a piece of text."""
     if not required_phrases:
@@ -324,6 +362,8 @@ class SupportEnvironment:
         self.messages_sent: list = []
         self.last_response: str = ""
         self.last_customer_reply: str | None = None
+        self.last_customer_sentiment: str | None = None
+        self.last_agent_sentiment: str | None = None
         self.is_done: bool = False
         self.task_id: str = "easy"
         self.step_count: int = 0
@@ -342,6 +382,8 @@ class SupportEnvironment:
         self.messages_sent = []
         self.last_response = "Environment reset. Ready."
         self.last_customer_reply = None
+        self.last_customer_sentiment = None
+        self.last_agent_sentiment = None
         self.is_done = False
         self.step_count = 0
         self.customer_satisfaction = 1.0
@@ -388,6 +430,8 @@ class SupportEnvironment:
             priority=self.ticket.get("priority", "medium"),
             last_api_response=self.last_response,
             last_customer_reply=self.last_customer_reply,
+            last_customer_sentiment=self.last_customer_sentiment,
+            last_agent_sentiment=self.last_agent_sentiment,
             messages_sent=self.messages_sent.copy(),
             action_history=self.history.copy(),
             step_count=self.step_count,
@@ -410,6 +454,7 @@ class SupportEnvironment:
         reward_value = STEP_DECAY  # base step-decay
         reason = "Step decay."
         self.last_customer_reply = None  # reset per step
+        self.last_customer_sentiment = None
 
         # ----- Max-step enforcement -----
         if self.step_count >= MAX_STEPS:
@@ -452,13 +497,24 @@ class SupportEnvironment:
             else:
                 self.messages_sent.append(action.message)
                 self.history.append(f"send_message: {action.message[:80]}...")
+                agent_sentiment = _analyze_sentiment(action.message)
+                self.last_agent_sentiment = str(agent_sentiment["label"])
                 self.last_customer_reply = _simulate_customer_reply(action.message, self.variant, self.messages_sent)
+                customer_sentiment = _analyze_sentiment(self.last_customer_reply)
+                self.last_customer_sentiment = str(customer_sentiment["label"])
                 self.last_response = f"Message sent. Customer replied: \"{self.last_customer_reply}\""
                 reward_value = 0.05
                 reason = "Communicated with the customer."
                 # Satisfaction boost for polite messages
                 if any(w in action.message.lower() for w in ["sorry", "apologize", "apologise", "thank"]):
                     self.customer_satisfaction = min(1.0, self.customer_satisfaction + 0.05)
+                # Basic sentiment-driven satisfaction shaping.
+                if customer_sentiment["label"] == "negative":
+                    self.customer_satisfaction = max(0.0, self.customer_satisfaction - 0.04)
+                elif customer_sentiment["label"] == "positive":
+                    self.customer_satisfaction = min(1.0, self.customer_satisfaction + 0.02)
+                if agent_sentiment["label"] == "negative":
+                    self.customer_satisfaction = max(0.0, self.customer_satisfaction - 0.02)
 
         # ------------------------------------------------------------------
         # ACTION: close_ticket
@@ -493,7 +549,13 @@ class SupportEnvironment:
 
         obs = self.get_state()
         reward = Reward(value=round(reward_value, 4), reason=reason)
-        info = Info(customer_satisfaction=round(self.customer_satisfaction, 4))
+        info = Info(
+            customer_satisfaction=round(self.customer_satisfaction, 4),
+            metrics={
+                "last_customer_sentiment": self.last_customer_sentiment,
+                "last_agent_sentiment": self.last_agent_sentiment,
+            },
+        )
         return obs, reward, self.is_done, info
 
     # ------------------------------------------------------------------

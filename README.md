@@ -53,10 +53,14 @@ Customer support is a high-volume, high-stakes task that real companies automate
 | `priority` | enum | `low`, `medium`, `high`, `critical` |
 | `last_api_response` | str? | Response from last API call |
 | `last_customer_reply` | str? | Customer's latest reply |
+| `last_customer_sentiment` | enum? | Sentiment inferred from latest customer reply: `positive`/`neutral`/`negative` |
+| `last_agent_sentiment` | enum? | Sentiment inferred from latest agent message: `positive`/`neutral`/`negative` |
 | `messages_sent` | list | All agent → customer messages |
 | `action_history` | list | All actions taken |
 | `step_count` | int | Steps taken so far |
 | `max_steps` | int | Hard limit (20) |
+
+The environment runs lightweight rule-based sentiment analysis on conversational turns and includes the latest labels in both observations and `info.metrics`.
 
 ---
 
