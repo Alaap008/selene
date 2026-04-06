@@ -281,7 +281,35 @@ def run_task(
                 llm_client, obs, messages, task_id, last_reward
             )
 
-            step_data = env_client.step(action_dict)
+            # Catch 422 validation errors so a bad action logs a -0.10 penalty
+            # and the episode continues rather than aborting the task.
+            try:
+                step_data = env_client.step(action_dict)
+            except requests.HTTPError as http_err:
+                error_msg = f"invalid_action:{http_err.response.status_code}"
+                log_step(
+                    step=step,
+                    action=_format_action(action_dict),
+                    reward=-0.10,
+                    done=False,
+                    error=error_msg,
+                )
+                penalty_reward = {"value": -0.10, "reason": error_msg}
+                rewards.append(-0.10)
+                steps_taken = step
+                last_reward = penalty_reward
+                # Feed the error back to the LLM so it can self-correct
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Your last action was rejected by the environment "
+                        f"(HTTP {http_err.response.status_code}). "
+                        "Make sure action_type, method, endpoint, resolution_code "
+                        "and all required fields are valid. Try again."
+                    ),
+                })
+                continue
+
             obs = step_data["observation"]
             reward = step_data["reward"]
             done = step_data["done"]
