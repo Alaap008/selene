@@ -3,10 +3,10 @@ inference.py — OpenEnv Customer Service Agent
 ==============================================
 Mandatory entrypoint for the OpenEnv evaluation platform.
 
-Environment variables:
-    API_BASE_URL       LLM API endpoint (default: HF router)
-    MODEL_NAME         Model identifier for inference
-    HF_TOKEN           Hugging Face / API key
+Environment variables (all required at runtime):
+    API_BASE_URL       LLM API endpoint  (default: https://api.openai.com/v1)
+    MODEL_NAME         Model identifier  (default: gpt-4o-mini)
+    HF_TOKEN           Hugging Face / OpenAI API key
     OPENENV_BASE_URL   Environment server URL (default: http://localhost:8000)
 """
 
@@ -21,9 +21,9 @@ from openai import OpenAI
 # ---------------------------------------------------------------------------
 # Required environment variables
 # ---------------------------------------------------------------------------
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
 OPENENV_BASE_URL = os.getenv("OPENENV_BASE_URL", "http://localhost:8000")
 
 BENCHMARK = "customer_service"
