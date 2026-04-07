@@ -333,9 +333,10 @@ def run_task(
                 break
 
         grade_data = env_client.grade()
-        score = grade_data.get("score", 0.0)
-        score = min(max(score, 0.0), 1.0)
-        success = score > 0.0
+        score = grade_data.get("score", 0.001)
+        # Evaluator requires score strictly in (0, 1) — never exactly 0.0 or 1.0
+        score = round(min(max(score, 0.001), 0.999), 4)
+        success = score > 0.001
 
     except Exception as exc:
         print(f"[DEBUG] Task {task_id} error: {exc}", flush=True)

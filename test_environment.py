@@ -218,7 +218,7 @@ class TestGrader:
         env.step(Action(action_type="close_ticket", resolution="Denied per policy.", resolution_code="denied"))
         result = env.grade()
         assert result["breakdown"]["correct_denial"] == 0.30
-        assert result["score"] == 1.0
+        assert result["score"] == 0.999
 
 
 class TestKnowledgeBase:

@@ -756,7 +756,7 @@ class SupportEnvironment:
 
             score = sum(breakdown.values())
 
-        # Clamp
-        score = round(max(0.0, min(1.0, score)), 4)
+        # Clamp strictly to (0.001, 0.999) — evaluator requires score ∈ (0, 1)
+        score = round(max(0.001, min(0.999, score)), 4)
 
         return {"score": score, "task": self.task_id, "breakdown": breakdown}

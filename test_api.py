@@ -176,7 +176,7 @@ class TestFullEpisodeFlow:
         assert r.json()["done"] is True
 
         grade = client.get("/grader").json()
-        assert grade["score"] == 1.0
+        assert grade["score"] == 0.999
 
     def test_hard_episode_without_research_is_capped(self, client):
         """Hard episode without policy/KB consultation is capped below 0.50."""
