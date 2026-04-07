@@ -262,7 +262,7 @@ def run_task(
 ) -> Dict[str, Any]:
     rewards: List[float] = []
     steps_taken = 0
-    score = 0.0
+    score = 0.001
     success = False
 
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
@@ -281,8 +281,6 @@ def run_task(
                 llm_client, obs, messages, task_id, last_reward
             )
 
-            # Catch 422 validation errors so a bad action logs a -0.10 penalty
-            # and the episode continues rather than aborting the task.
             try:
                 step_data = env_client.step(action_dict)
             except requests.HTTPError as http_err:
@@ -298,7 +296,6 @@ def run_task(
                 rewards.append(-0.10)
                 steps_taken = step
                 last_reward = penalty_reward
-                # Feed the error back to the LLM so it can self-correct
                 messages.append({
                     "role": "user",
                     "content": (
@@ -334,14 +331,13 @@ def run_task(
 
         grade_data = env_client.grade()
         score = grade_data.get("score", 0.001)
-        # Evaluator requires score strictly in (0, 1) — never exactly 0.0 or 1.0
-        score = round(min(max(score, 0.001), 0.999), 4)
         success = score > 0.001
 
     except Exception as exc:
         print(f"[DEBUG] Task {task_id} error: {exc}", flush=True)
 
     finally:
+        score = round(min(max(score, 0.001), 0.999), 4)
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
     return {"task_id": task_id, "score": score, "success": success, "steps": steps_taken}
