@@ -113,7 +113,7 @@ class TestGraderEndpoint:
         client.post("/reset", json={"task_id": "easy", "seed": 42})
         r = client.get("/grader")
         assert r.status_code == 200
-        assert r.json()["score"] == 0.0
+        assert r.json()["score"] == 0.001
 
     def test_grader_after_close(self, client):
         client.post("/reset", json={"task_id": "easy", "seed": 42})

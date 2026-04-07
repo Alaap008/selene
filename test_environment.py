@@ -116,7 +116,7 @@ class TestGrader:
         env = SupportEnvironment()
         env.reset("easy", seed=42)
         result = env.grade()
-        assert result["score"] == 0.0
+        assert result["score"] == 0.001
         assert "not finished" in result.get("reason", "").lower()
 
     def test_grader_score_range(self):

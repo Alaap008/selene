@@ -656,7 +656,7 @@ class SupportEnvironment:
         Returns {"score": float, "task": str, "breakdown": dict}
         """
         if not self.is_done:
-            return {"score": 0.0, "task": self.task_id, "reason": "Episode not finished."}
+            return {"score": 0.001, "task": self.task_id, "reason": "Episode not finished."}
 
         expected = self.variant.get("expected", {})
         breakdown = {}
