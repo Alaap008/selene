@@ -23,7 +23,7 @@ from openai import OpenAI
 # ---------------------------------------------------------------------------
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
 OPENENV_BASE_URL = os.getenv("OPENENV_BASE_URL", "http://localhost:8000")
 
 BENCHMARK = "customer_service"
@@ -353,7 +353,7 @@ def run_task(
 
 def main() -> None:
     if not HF_TOKEN:
-        print("[DEBUG] HF_TOKEN / API_KEY not set — aborting.", flush=True)
+        print("[DEBUG] HF_TOKEN not set — aborting.", flush=True)
         sys.exit(1)
 
     llm_client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
