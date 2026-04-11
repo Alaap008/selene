@@ -1,107 +1,147 @@
 ---
-title: Customer Service Agent OpenEnv
-emoji: 🎧
-colorFrom: blue
-colorTo: purple
+title: EV Charging Scheduler OpenEnv
+emoji: ⚡
+colorFrom: green
+colorTo: yellow
 sdk: docker
 app_port: 8000
 tags:
   - openenv
 ---
 
-# Customer Service Agent — OpenEnv Environment
+# EV Charging Scheduler — OpenEnv RL Benchmark
 
-An AI agent that resolves customer support tickets by querying internal systems, communicating with customers, and taking actions (refunds, escalations). Built for the [OpenEnv](https://huggingface.co/openenv) challenge.
+An RL benchmark for allocating charging slots across electric vehicles to **minimise energy cost and lateness** while **respecting grid limits**. Built for the [OpenEnv](https://huggingface.co/openenv) challenge.
 
-## Why Customer Service?
+## Why EV Charging?
 
-Customer support is a high-volume, high-stakes task that real companies automate today. This environment models the decision-making a human agent faces: verifying order data, checking company policies, detecting fraud, communicating empathetically, and choosing the correct resolution. It goes beyond simple lookup — agents must reason about policies, handle edge cases, and manage customer satisfaction.
+EV charging is a timely, real-world optimisation problem with clean mathematical structure. The agent must balance competing objectives (cost vs. timeliness) under hard constraints (grid capacity, charger availability), making it ideal for RL training and evaluation.
 
 ---
 
-## Action Space
+## Core Loop
 
-| Action Type | Required Fields | Description |
-|---|---|---|
-| `call_api` | `method`, `endpoint`, `payload` (POST) | Query/mutate internal APIs |
-| `send_message` | `message` | Reply to the customer |
-| `close_ticket` | `resolution`, `resolution_code` | Close the ticket |
+```
+state → action → reward (every step)
+```
 
-### Available API Endpoints
+```python
+from environment import ChargingEnvironment
+from models import Action
 
-| Method | Endpoint | Description |
-|---|---|---|
-| GET | `/orders/{id}` | Retrieve order details |
-| GET | `/customers/{id}` | Retrieve customer profile (fraud flags) |
-| GET | `/policies` | Get refund and fraud policies |
-| GET | `/knowledge_base?q={query}` | Search the knowledge base |
-| POST | `/refunds` | Issue a refund (`order_id`, `amount`, `reason`) |
-| POST | `/escalate` | Escalate to supervisor |
+env = ChargingEnvironment()
+obs = env.reset("medium", seed=42)
 
-### Resolution Codes
-`resolved` · `refunded` · `escalated` · `denied` · `info_provided`
+done = False
+while not done:
+    mask = obs.action_mask          # N×4 boolean mask
+    actions = your_agent(obs.state, mask)
+    obs, reward, done, info = env.step(Action(actions=actions))
+    print(f"reward={reward.value:+.3f}  cost={reward.breakdown['energy_cost']:.3f}")
+
+grade = env.grade()
+print(f"Final score: {grade['score']:.4f}")
+```
 
 ---
 
 ## Observation Space
 
-| Field | Type | Description |
-|---|---|---|
-| `ticket_id` | str | Current ticket ID |
-| `customer_request` | str | Customer's original message |
-| `customer_name` | str | Customer's display name |
-| `priority` | enum | `low`, `medium`, `high`, `critical` |
-| `last_api_response` | str? | Response from last API call |
-| `last_customer_reply` | str? | Customer's latest reply |
-| `last_customer_sentiment` | enum? | Sentiment inferred from latest customer reply: `positive`/`neutral`/`negative` |
-| `last_agent_sentiment` | enum? | Sentiment inferred from latest agent message: `positive`/`neutral`/`negative` |
-| `messages_sent` | list | All agent → customer messages |
-| `action_history` | list | All actions taken |
-| `step_count` | int | Steps taken so far |
-| `max_steps` | int | Hard limit (20) |
+Fixed-size `float32` vector, fully numeric. For `N` charger ports:
 
-The environment runs lightweight rule-based sentiment analysis on conversational turns and includes the latest labels in both observations and `info.metrics`.
+| Index Range | Feature | Range |
+|---|---|---|
+| `[0..N-1]` | Current SoC per port (0 if empty) | `[0, 1]` |
+| `[N..2N-1]` | Target SoC per port | `[0, 1]` |
+| `[2N..3N-1]` | Time remaining until departure (normalised) | `[0, 1]` |
+| `[3N..4N-1]` | Port occupied (binary) | `{0, 1}` |
+| `[4N..5N-1]` | Port operational (binary) | `{0, 1}` |
+| `[5N]` | Current electricity tariff | `[0, 1]` |
+| `[5N+1]` | Grid load ratio | `[0, 1]` |
+| `[5N+2]` | Time of day (normalised) | `[0, 1]` |
+| `[5N+3]` | Steps remaining (normalised) | `[0, 1]` |
+
+**Total size**: `5N + 4` (e.g., 24 for easy, 34 for medium, 44 for hard)
 
 ---
 
-## Reward Design
+## Action Space
 
-| Signal | Value | When |
+**MultiDiscrete([4] × N)** — for each of `N` ports, select a charging level:
+
+| Level | Power | Description |
 |---|---|---|
-| Step decay | −0.01 | Every step (efficiency incentive) |
-| Useful GET (first call) | +0.10 | Retrieving relevant data for the first time |
-| Duplicate GET | 0.00 | Same endpoint called again — data returned, no reward |
-| Refund executed | +0.20 | Valid refund processed |
-| Customer message | +0.05 | Communicating with customer |
-| Polite message | +0.05 sat | "sorry", "thank" → satisfaction boost |
-| Malformed action | −0.10 | Missing required fields |
-| Fraud refund | −0.40 | Refunding a fraud-flagged user |
-| Over-refund | −0.30 | Amount exceeds order total |
-| Max steps hit | −0.50 | Episode auto-terminated |
-| Close ticket | 0–0.50 | Proportional to grader score at close |
+| 0 | 0 kW | OFF |
+| 1 | 3.6 kW | LOW |
+| 2 | 7 kW | MEDIUM |
+| 3 | 11 kW | HIGH |
 
----
+### Action Masking
 
-## Tasks & Difficulty
+Every observation includes an `action_mask: bool[N][4]`:
 
-### Easy — Order Status Lookup
-Agent must find order details and relay tracking info. Scored on: data retrieval, info accuracy in resolution, customer communication, resolution code.
-
-### Medium — Standard Refund
-Agent checks policies, verifies order eligibility, processes the correct refund amount. Scored on: policy check, correct refund amount, data retrieval, communication, resolution code.
-
-### Hard — Fraud Detection / Partial Refund / Adversarial Customers
-Complex scenarios with **adversarial customer personalities** that test multi-turn reasoning:
-
-| Personality | Behavior |
+| Condition | Masked Actions |
 |---|---|
-| **Aggressive** | Threatens negative reviews and demands managers on denial |
-| **Persistent** | Rejects partial refunds and repeats full-refund demands |
-| **Manipulative** | Uses emotional appeals and claims of innocence when fraud-flagged |
-| **Social Engineer** | Impersonates management, fabricates override codes, pressures agent |
-| **Contradictory** | Changes their story across turns (damaged → wrong item → both) |
+| Port empty | Only OFF allowed |
+| Port failed (hard mode) | Only OFF allowed |
+| Vehicle fully charged | Only OFF allowed |
+| Grid overload risk | HIGH masked on excess ports |
 
-**Research gate**: The core decision score (denial or refund accuracy, worth 0.30) is **gated behind policy + KB consultation**. Without checking `/policies` and `/knowledge_base`, the decision credit is zero. **Customer satisfaction** (tracked throughout the episode) contributes 5–10% of the final grade across all tasks. Scored on: order review, customer profile check, policy check, KB check, correct denial/partial refund, communication, resolution code, satisfaction.
+---
+
+## Reward Design — Dense, Per-Step
+
+| Signal | Value | Purpose |
+|---|---|---|
+| Energy cost | `−Σ(power × tariff)` (normalised) | Push toward cheap charging |
+| Charging progress | `+Σ(ΔSoC)` | Reward making progress |
+| Lateness penalty | `−0.5 × shortfall` per vehicle | Punish failing departure targets |
+| Grid violation | `−0.5` | Hard constraint signal |
+| Idle penalty | `−0.01` per idle occupied port | Discourage inaction |
+| Completion bonus | `+0.3` per satisfied vehicle | Milestone reward |
+| Episode end | `+1.0 × (satisfied/total)` | Overall success signal |
+
+Every step returns a meaningful scalar — **no deferred grading**.
+
+---
+
+## Tasks & Difficulty Curriculum
+
+| Task | Ports | Vehicles | Tariff | Grid Limit | Failures | Urgent | Departures |
+|---|---|---|---|---|---|---|---|
+| **easy** | 4 | 3 | Flat (0.30) | 100 kW | ✗ | ✗ | Relaxed |
+| **medium** | 6 | 5 | Time-of-Use | 55 kW | ✗ | ✗ | Tighter |
+| **hard** | 8 | 8 | Time-of-Use | 45 kW | ✓ | ✓ | Mixed |
+
+Each difficulty adds **strictly more constraints** — same core objective, tighter bounds. This is an algorithmically progressive curriculum, not scenario-driven.
+
+---
+
+## Grader (Score 0.0–1.0)
+
+| Component | Weight | Description |
+|---|---|---|
+| Vehicle satisfaction | 0.40 | Fraction of vehicles reaching target SoC |
+| Energy efficiency | 0.25 | Lower total cost = higher score |
+| Grid compliance | 0.20 | Fewer grid violations = higher score |
+| Timeliness | 0.15 | How close all vehicles are to their targets |
+
+---
+
+## Baseline Scores
+
+Three built-in heuristic baselines (no LLM needed):
+
+| Strategy | Easy | Medium | Hard | Average |
+|---|---|---|---|---|
+| Random | ~0.90 | ~0.63 | ~0.47 | ~0.67 |
+| Greedy-Cheapest | ~0.90 | ~0.92 | ~0.80 | ~0.87 |
+| Urgency-Aware | ~0.90 | ~0.92 | ~0.80 | ~0.87 |
+
+Run baselines:
+```bash
+python heuristic.py
+```
 
 ---
 
@@ -116,66 +156,55 @@ uvicorn server.app:app --reload
 ### Run Tests
 ```bash
 pip install pytest
-python -m pytest test_environment.py -v
+python -m pytest test_environment.py test_api.py -v
 ```
 
-### Run Baseline Agent
+### Run Inference (Self-Contained)
 ```bash
-# Or put these in .env.local
-export OPENAI_API_KEY="sk-..."
-export OPENAI_MODEL="gpt-4o"
-export OPENAI_BASELINE_SEED="42"
-python baseline.py
-```
-
-The CLI baseline uses the OpenAI API client with `temperature=0.0`, `top_p=1.0`, and a fixed `seed` for reproducibility. The `/baseline` endpoint runs the same logic in-process against an isolated environment instance, avoiding self-calls back into the HTTP server.
-
-You can also store local secrets in `.env.local`:
-
-```env
-OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-4o
-OPENAI_BASELINE_SEED=42
+# Uses in-process environment — no HTTP dependency
+export HF_TOKEN="your-key"
+export MODEL_NAME="gpt-4o-mini"
+python inference.py
 ```
 
 ### Docker
 ```bash
-docker build -t openenv-support-agent .
-docker run -p 8000:8000 openenv-support-agent
+docker build -t openenv-ev-charging .
+docker run -p 8000:8000 openenv-ev-charging
 ```
 
 ---
 
-## Baseline Scores
+## PPO Training Example (Conceptual)
 
-Baseline run recorded with `python baseline.py`, model `gpt-4o`, `temperature=0.0`, `top_p=1.0`, and `seed=42`. Scores reflect the rebalanced grader (satisfaction integrated, duplicate GET penalty, dead weight redistribution).
+```python
+import gymnasium as gym
+from stable_baselines3 import PPO
+from environment import ChargingEnvironment
+from models import Action
 
-| Task | Score | Notes |
-|---|---|---|
-| Easy | `0.65–0.70` | Correct order retrieval and customer reply; satisfaction bonus included |
-| Medium | `0.95–1.00` | Full refund flow with policy and order checks; satisfaction component |
-| Hard | `0.85–0.95` | Correct denial with research gate; adversarial customer handling |
-| **Average** | **`0.82–0.88`** | Ranges reflect LLM non-determinism across runs |
+# Wrap ChargingEnvironment in a Gym-compatible wrapper
+class EVChargingGymEnv(gym.Env):
+    def __init__(self, task_id="medium"):
+        super().__init__()
+        self.env = ChargingEnvironment()
+        self.task_id = task_id
+        N = self.env.config["num_ports"]
+        self.observation_space = gym.spaces.Box(0, 1, shape=(5*N+4,))
+        self.action_space = gym.spaces.MultiDiscrete([4] * N)
 
-Recommended baseline configuration:
+    def reset(self, seed=None, **kwargs):
+        obs = self.env.reset(self.task_id, seed=seed)
+        return obs.state, {"action_mask": obs.action_mask}
 
-| Setting | Value |
-|---|---|
-| Model | `gpt-4o` |
-| Temperature | `0.0` |
-| Top-p | `1.0` |
-| Seed | `42` |
+    def step(self, action):
+        obs, reward, done, info = self.env.step(Action(actions=action.tolist()))
+        return obs.state, reward.value, done, False, info.metrics
 
-If the OpenAI API is unavailable, `baseline.py` now exits non-zero instead of silently fabricating actions. The deployed Hugging Face Space should expose `/baseline` once `OPENAI_API_KEY` is configured as a Space secret.
-
----
-
-## Deployment to Hugging Face Spaces
-
-1. Create a new Docker Space on [huggingface.co](https://huggingface.co/new-space)
-2. Clone the Space repo and copy all project files
-3. `git add . && git commit -m "initial" && git push`
-4. The Space will auto-build and deploy
+env = EVChargingGymEnv("medium")
+model = PPO("MlpPolicy", env, verbose=1)
+model.learn(total_timesteps=100_000)
+```
 
 ---
 
@@ -184,15 +213,16 @@ If the OpenAI API is unavailable, `baseline.py` now exits non-zero instead of si
 ```
 selene/
 ├── main.py              # FastAPI server (step/reset/state/tasks/grader/baseline)
-├── server/app.py        # OpenEnv multi-mode server entrypoint
-├── environment.py       # Core environment logic, ticket variants, grader
+├── server/app.py        # OpenEnv ASGI entrypoint
+├── environment.py       # Core environment: ChargingEnvironment
 ├── models.py            # Pydantic models (Action, Observation, Reward, Info)
-├── baseline.py          # OpenAI-powered baseline agent
-├── test_environment.py  # Unit tests for environment logic
-├── test_api.py          # HTTP integration tests for FastAPI endpoints
+├── inference.py         # Self-contained inference (in-process env, no HTTP)
+├── baseline.py          # Multi-strategy baseline runner
+├── heuristic.py         # Standalone heuristic agents (random/greedy/urgency)
+├── test_environment.py  # Unit tests for environment
+├── test_api.py          # HTTP integration tests
 ├── openenv.yaml         # OpenEnv spec metadata
-├── pyproject.toml       # Multi-mode packaging metadata
-├── uv.lock              # Lockfile for OpenEnv validation
+├── pyproject.toml       # Packaging metadata
 ├── requirements.txt     # Python dependencies
 ├── Dockerfile           # Container definition
 └── .dockerignore        # Docker build exclusions
@@ -200,5 +230,6 @@ selene/
 
 ## Verification
 
-- `python -m pytest test_environment.py test_api.py -v` -> 55 tests passed (37 unit + 18 HTTP integration)
-- `openenv validate` -> passed
+- `python -m pytest test_environment.py test_api.py -v` → 40+ tests
+- `python heuristic.py` → baseline scores
+- `openenv validate` → passed

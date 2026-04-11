@@ -1,102 +1,82 @@
 """
-Typed Pydantic models for the Customer Service Agent OpenEnv environment.
+Typed Pydantic models for the EV Charging Scheduler OpenEnv environment.
 Covers Action, Observation, Reward, and Info as required by the OpenEnv spec.
+
+All observations are fixed-size numeric arrays — no free-form text.
+Actions are discrete per-port charging levels with action masking.
 """
 
 from pydantic import BaseModel, Field
-from typing import Dict, Any, List, Optional, Literal
+from typing import Dict, Any, List, Optional
 
 
 class Action(BaseModel):
     """
     The action the agent takes each step.
-    Three action types:
-      - call_api: interact with internal backend systems (orders, customers, policies, knowledge base, refunds)
-      - send_message: reply to the customer
-      - close_ticket: resolve and close the ticket
+
+    Each element corresponds to a charger port and selects a discrete
+    charging power level:
+        0 = OFF    (0 kW)
+        1 = LOW    (3.6 kW)
+        2 = MEDIUM (7 kW)
+        3 = HIGH   (11 kW)
     """
-    action_type: Literal["call_api", "send_message", "close_ticket"] = Field(
+    actions: List[int] = Field(
         ...,
         description=(
-            "The type of action. "
-            "'call_api' queries or mutates internal systems. "
-            "'send_message' replies to the customer. "
-            "'close_ticket' closes the ticket with a resolution."
+            "List of charging level selections, one per port. "
+            "Length must equal the number of ports. "
+            "Each value in {0, 1, 2, 3}."
         ),
-    )
-    # --- call_api fields ---
-    endpoint: Optional[str] = Field(
-        None,
-        description="API endpoint to call, e.g. '/orders/O-100', '/policies', '/customers/C-123', '/knowledge_base?q=refund', '/refunds'. Required when action_type='call_api'.",
-    )
-    method: Optional[Literal["GET", "POST"]] = Field(
-        None,
-        description="HTTP method. Required when action_type='call_api'.",
-    )
-    payload: Optional[Dict[str, Any]] = Field(
-        None,
-        description="JSON body for POST requests. Required for POST /refunds (keys: order_id, amount, reason).",
-    )
-    # --- send_message fields ---
-    message: Optional[str] = Field(
-        None,
-        description="Message text to send to the customer. Required when action_type='send_message'.",
-    )
-    # --- close_ticket fields ---
-    resolution: Optional[str] = Field(
-        None,
-        description="Resolution summary. Required when action_type='close_ticket'.",
-    )
-    resolution_code: Optional[Literal[
-        "resolved", "refunded", "escalated", "denied", "info_provided"
-    ]] = Field(
-        None,
-        description="Structured resolution code. Required when action_type='close_ticket'.",
     )
 
 
 class Observation(BaseModel):
-    """What the agent sees after each step."""
-    ticket_id: str = Field(..., description="Current support ticket ID.")
-    customer_request: str = Field(..., description="The customer's original request text.")
-    customer_name: str = Field("", description="The customer's display name.")
-    priority: Literal["low", "medium", "high", "critical"] = Field(
-        "medium", description="Ticket priority level."
+    """
+    Fixed-size numeric observation vector plus action mask.
+
+    The state vector layout for N ports:
+        [0..N-1]     current_soc      — current state-of-charge per port (0 if empty)
+        [N..2N-1]    target_soc       — required SoC at departure per port
+        [2N..3N-1]   time_remaining   — normalised time until departure per port
+        [3N..4N-1]   port_occupied    — 1.0 if a vehicle is present, 0.0 otherwise
+        [4N..5N-1]   port_operational — 1.0 if the port is working, 0.0 if failed
+        [5N]         tariff           — current electricity tariff (normalised)
+        [5N+1]       grid_load        — current demand / max grid capacity
+        [5N+2]       time_of_day      — normalised hour (0.0=midnight, 0.5=noon)
+        [5N+3]       steps_remaining  — normalised steps left in the episode
+    """
+    state: List[float] = Field(
+        ..., description="Fixed-size numeric observation vector.",
     )
-    last_api_response: Optional[str] = Field(
-        None, description="JSON response from the last API call, or error message."
-    )
-    last_customer_reply: Optional[str] = Field(
-        None, description="The customer's latest reply after agent sent a message."
-    )
-    last_customer_sentiment: Optional[Literal["positive", "neutral", "negative"]] = Field(
-        None, description="Sentiment label inferred from the latest customer reply."
-    )
-    last_agent_sentiment: Optional[Literal["positive", "neutral", "negative"]] = Field(
-        None, description="Sentiment label inferred from the latest agent message."
-    )
-    messages_sent: List[str] = Field(
-        default_factory=list, description="All messages the agent has sent to the customer."
-    )
-    action_history: List[str] = Field(
-        default_factory=list, description="All actions taken so far."
+    action_mask: List[List[bool]] = Field(
+        ...,
+        description=(
+            "Boolean mask of shape (N, 4). action_mask[i][j] is True if "
+            "charging level j is valid for port i at this step."
+        ),
     )
     step_count: int = Field(0, description="Number of steps taken so far.")
-    max_steps: int = Field(20, description="Maximum steps before auto-termination.")
+    max_steps: int = Field(48, description="Maximum steps in this episode.")
+    num_ports: int = Field(..., description="Number of charger ports (N).")
 
 
 class Reward(BaseModel):
-    """Reward signal returned each step."""
-    value: float = Field(..., description="Reward value for the last action.")
+    """Dense reward signal returned every step."""
+    value: float = Field(..., description="Scalar reward for the last action.")
     reason: str = Field(..., description="Human-readable explanation.")
+    breakdown: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Per-component reward breakdown (energy_cost, progress, lateness, etc.).",
+    )
 
 
 class Info(BaseModel):
-    """Additional episode metadata."""
-    customer_satisfaction: float = Field(
-        1.0, description="Customer satisfaction score (0.0–1.0), degrades with bad interactions."
-    )
+    """Episode metrics and debug information."""
     metrics: Dict[str, Any] = Field(
         default_factory=dict,
-        description="Debug metrics such as per-turn sentiment labels.",
+        description=(
+            "Structured metrics: energy_cost_total, vehicles_satisfied, "
+            "vehicles_departed, grid_violations, total_energy_kwh, etc."
+        ),
     )

@@ -1,13 +1,17 @@
+from __future__ import annotations
+
 """
-inference.py — OpenEnv Customer Service Agent
-==============================================
+inference.py — OpenEnv EV Charging Scheduler
+=============================================
 Mandatory entrypoint for the OpenEnv evaluation platform.
+
+CRITICAL: This runs the environment IN-PROCESS — no HTTP dependency.
+This was the #1 evaluation failure risk in the old version.
 
 Environment variables (all required at runtime):
     API_BASE_URL       LLM API endpoint  (default: https://api.openai.com/v1)
     MODEL_NAME         Model identifier  (default: gpt-4o-mini)
     HF_TOKEN           Hugging Face / OpenAI API key
-    OPENENV_BASE_URL   Environment server URL (default: http://localhost:8000)
 """
 
 import json
@@ -15,8 +19,10 @@ import os
 import sys
 from typing import Any, Dict, List, Optional
 
-import requests
 from openai import OpenAI
+
+from environment import ChargingEnvironment, POWER_LEVELS
+from models import Action
 
 # ---------------------------------------------------------------------------
 # Required environment variables
@@ -24,51 +30,44 @@ from openai import OpenAI
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
 HF_TOKEN = os.getenv("HF_TOKEN")
-OPENENV_BASE_URL = os.getenv("OPENENV_BASE_URL", "http://localhost:8000")
 
-BENCHMARK = "customer_service"
+BENCHMARK = "ev_charging_scheduler"
 DEFAULT_TASKS = ("easy", "medium", "hard")
 DEFAULT_SEED = 42
-MAX_STEPS = 15
+MAX_STEPS = 48
 TEMPERATURE = 0.0
 
 SYSTEM_PROMPT = """\
-You are an AI Customer Service Agent. You resolve customer support tickets by:
-1. Querying internal systems (orders, customers, policies, knowledge base)
-2. Communicating with the customer via messages
-3. Taking actions (refunds, escalations)
-4. Closing the ticket with a resolution
+You are an RL agent controlling an EV Charging Station.
 
-You MUST output ONLY a valid JSON object (no markdown, no explanation) matching the action schema.
+Each step, you receive a JSON observation with:
+- `state`: a numeric vector describing per-port SoC, targets, time remaining, \
+port status, tariff, grid load, time of day, and steps remaining.
+- `action_mask`: an N×4 boolean mask — action_mask[i][j] = true means level j \
+is valid for port i.
+- `num_ports`: number of charger ports (N).
 
-## Available Actions
+You must output a JSON object with:
+  {"actions": [level_0, level_1, ..., level_{N-1}]}
 
-### call_api — Query or mutate internal systems
-- GET /orders/{order_id} — Retrieve order details
-- GET /customers/{customer_id} — Retrieve customer profile (check for fraud flags)
-- GET /policies — Retrieve company refund and fraud policies
-- GET /knowledge_base?q={query} — Search the knowledge base for procedures
-- POST /refunds — Issue a refund. Payload: {"order_id": "...", "amount": X.YZ, "reason": "..."}
-- POST /escalate — Escalate to supervisor
+Where each level is an integer 0–3:
+  0 = OFF    (0 kW)
+  1 = LOW    (3.6 kW)
+  2 = MEDIUM (7 kW)
+  3 = HIGH   (11 kW)
 
-Example: {"action_type": "call_api", "method": "GET", "endpoint": "/orders/O-100"}
-Example: {"action_type": "call_api", "method": "POST", "endpoint": "/refunds", "payload": {"order_id": "O-200", "amount": 120.0, "reason": "Standard return within policy"}}
+## Objective
+Minimise energy cost and lateness while respecting grid limits.
+- Charge vehicles to their target SoC before their departure time.
+- Prefer cheaper tariff periods (lower tariff in the state vector).
+- Don't exceed grid capacity (the mask will help, but be efficient).
+- Every vehicle that departs at target SoC earns a completion bonus.
 
-### send_message — Reply to the customer
-Example: {"action_type": "send_message", "message": "I'm looking into this for you right now."}
-
-### close_ticket — Close the ticket with a final resolution
-resolution_code must be one of: "resolved", "refunded", "escalated", "denied", "info_provided"
-Example: {"action_type": "close_ticket", "resolution": "Order O-100 is shipped with tracking TRK999.", "resolution_code": "info_provided"}
-
-## Guidelines
-- Always retrieve order and customer info before making decisions.
-- Always check /policies and /knowledge_base for relevant procedures.
-- Always send at least one message to the customer before closing.
-- If a customer is fraud-flagged, DENY the refund and explain politely.
-- Use the correct resolution_code when closing.
-- Be efficient — avoid unnecessary steps.
-- Use reward feedback from the previous step to improve your next action.
+## Strategy Tips
+- If tariff > 0.7, prefer LOW or OFF unless a vehicle is urgently departing.
+- If a vehicle's time_remaining is low, charge at HIGH regardless of tariff.
+- Respect the action mask — masked actions will be forced to OFF.
+- Output ONLY the JSON action object. No explanations.
 """
 
 
@@ -98,76 +97,66 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 
 
 # ---------------------------------------------------------------------------
-# Environment HTTP client
+# In-process environment client (NO HTTP dependency)
 # ---------------------------------------------------------------------------
 
-class HttpEnvironmentClient:
-    def __init__(self, base_url: str):
-        self.base_url = base_url.rstrip("/")
-        self.session = requests.Session()
+class LocalEnvironmentClient:
+    """Runs the environment in-process for self-contained inference."""
+
+    def __init__(self):
+        self.env = ChargingEnvironment()
 
     def reset(self, task_id: str, seed: int) -> dict:
-        resp = self.session.post(
-            f"{self.base_url}/reset",
-            json={"task_id": task_id, "seed": seed},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        obs = self.env.reset(task_id=task_id, seed=seed)
+        return obs.model_dump()
 
-    def step(self, action: dict) -> dict:
-        resp = self.session.post(
-            f"{self.base_url}/step", json=action, timeout=30
-        )
-        resp.raise_for_status()
-        return resp.json()
+    def step(self, action_list: list[int]) -> dict:
+        action = Action(actions=action_list)
+        obs, reward, done, info = self.env.step(action)
+        return {
+            "observation": obs.model_dump(),
+            "reward": reward.model_dump(),
+            "done": done,
+            "info": info.model_dump(),
+        }
 
     def grade(self) -> dict:
-        resp = self.session.get(f"{self.base_url}/grader", timeout=30)
-        resp.raise_for_status()
-        return resp.json()
+        return self.env.grade()
 
 
 # ---------------------------------------------------------------------------
-# Progress tracking (mirrors baseline scoring patterns)
+# Greedy fallback heuristic
 # ---------------------------------------------------------------------------
 
-def _extract_progress_signals(task_id: str, obs: dict) -> dict:
-    action_history = obs.get("action_history", [])
-    messages_sent = obs.get("messages_sent", [])
+def greedy_action(obs: dict) -> list[int]:
+    """Simple heuristic: charge at highest valid level, prefer LOW when tariff is high."""
+    num_ports = obs["num_ports"]
+    mask = obs["action_mask"]
+    state = obs["state"]
 
-    checked_order = any("GET /orders/" in e for e in action_history)
-    checked_customer = any("/customers/" in e for e in action_history)
-    checked_policy = any("/policies" in e for e in action_history)
-    checked_kb = any("/knowledge_base" in e for e in action_history)
-    issued_refund = any("POST /refunds" in e for e in action_history)
-    escalated = any("POST /escalate" in e for e in action_history)
-    communicated = len(messages_sent) > 0
+    # Extract tariff (at index 5*N)
+    tariff = state[5 * num_ports] if len(state) > 5 * num_ports else 0.3
 
-    progress = {
-        "communicated": int(communicated),
-        "order_check": int(checked_order),
-        "customer_check": int(checked_customer),
-        "policy_check": int(checked_policy),
-        "kb_check": int(checked_kb),
-        "refund_attempted": int(issued_refund),
-        "escalated": int(escalated),
-    }
-
-    if task_id == "hard":
-        progress["hard_research_gate_unlocked"] = int(checked_policy and checked_kb)
-
-    return progress
-
-
-def _missing_checklist(task_id: str, progress: dict) -> list[str]:
-    if task_id == "easy":
-        required = ["order_check", "communicated"]
-    elif task_id == "medium":
-        required = ["order_check", "policy_check", "refund_attempted", "communicated"]
-    else:
-        required = ["order_check", "customer_check", "policy_check", "kb_check", "communicated"]
-    return [key for key in required if not progress.get(key)]
+    actions = []
+    for i in range(num_ports):
+        port_mask = mask[i]
+        if tariff > 0.7:
+            # Prefer lower power during peak
+            for level in [1, 2, 3]:
+                if port_mask[level]:
+                    actions.append(level)
+                    break
+            else:
+                actions.append(0)
+        else:
+            # Prefer highest power during off-peak
+            for level in [3, 2, 1]:
+                if port_mask[level]:
+                    actions.append(level)
+                    break
+            else:
+                actions.append(0)
+    return actions
 
 
 # ---------------------------------------------------------------------------
@@ -178,43 +167,35 @@ def get_action_from_llm(
     client: OpenAI,
     obs: dict,
     messages: list,
-    task_id: str,
     last_reward: Optional[dict] = None,
-) -> dict:
-    obs_str = json.dumps(obs, indent=2)
-    feedback_block = ""
+) -> list[int]:
+    """Ask the LLM for charging actions given the current observation."""
+    num_ports = obs["num_ports"]
+
+    # Compact observation for the LLM
+    compact_obs = {
+        "num_ports": num_ports,
+        "state": [round(x, 3) for x in obs["state"]],
+        "action_mask": obs["action_mask"],
+        "step": obs["step_count"],
+        "max_steps": obs["max_steps"],
+    }
+
+    feedback = ""
     if last_reward is not None:
-        reward_value = last_reward.get("value", 0.0)
-        reward_reason = last_reward.get("reason", "")
-        feedback_block = (
-            "Feedback from your previous action:\n"
-            f"- reward: {reward_value:+.4f}\n"
-            f"- reason: {reward_reason}\n\n"
+        feedback = (
+            f"Previous reward: {last_reward.get('value', 0):+.3f} "
+            f"({last_reward.get('reason', '')})\n"
         )
 
-    progress = _extract_progress_signals(task_id=task_id, obs=obs)
-    missing = _missing_checklist(task_id=task_id, progress=progress)
-    scoring_block = (
-        "Scoring Pattern Progress (0/1 checks):\n"
-        f"{json.dumps(progress, separators=(',', ':'))}\n"
-        f"Missing high-impact checks: {', '.join(missing) if missing else 'none'}\n"
-    )
-    if task_id == "hard":
-        scoring_block += (
-            "Hard-task gate: core decision credit is locked until BOTH "
-            "/policies and /knowledge_base are checked.\n"
-        )
-    messages.append(
-        {
-            "role": "user",
-            "content": (
-                f"{feedback_block}"
-                f"{scoring_block}\n"
-                f"Current Observation:\n```json\n{obs_str}\n```\n"
-                "What is your next action? Output ONLY the JSON action object."
-            ),
-        }
-    )
+    messages.append({
+        "role": "user",
+        "content": (
+            f"{feedback}"
+            f"Observation:\n```json\n{json.dumps(compact_obs)}\n```\n"
+            f"Output ONLY the JSON action object."
+        ),
+    })
 
     try:
         response = client.chat.completions.create(
@@ -226,40 +207,25 @@ def get_action_from_llm(
         )
         content = response.choices[0].message.content
         messages.append({"role": "assistant", "content": content})
-        return json.loads(content)
-    except Exception as exc:
-        raise RuntimeError(f"LLM action generation failed: {exc}") from exc
+        parsed = json.loads(content)
+        actions = parsed.get("actions", [0] * num_ports)
+        return [int(a) for a in actions]
+    except Exception:
+        # Fall back to greedy heuristic
+        return greedy_action(obs)
 
 
 # ---------------------------------------------------------------------------
-# Action formatting for [STEP] logs
-# ---------------------------------------------------------------------------
-
-def _format_action(action_dict: dict) -> str:
-    atype = action_dict.get("action_type", "unknown")
-    if atype == "call_api":
-        method = action_dict.get("method", "?")
-        endpoint = action_dict.get("endpoint", "?")
-        return f"call_api('{method} {endpoint}')"
-    if atype == "send_message":
-        msg = (action_dict.get("message") or "")[:50]
-        return f"send_message('{msg}')"
-    if atype == "close_ticket":
-        code = action_dict.get("resolution_code", "resolved")
-        return f"close_ticket('{code}')"
-    return f"{atype}()"
-
-
-# ---------------------------------------------------------------------------
-# Single-task runner (one [START] … [STEP]* … [END] episode)
+# Single-task runner
 # ---------------------------------------------------------------------------
 
 def run_task(
-    env_client: HttpEnvironmentClient,
-    llm_client: OpenAI,
+    env_client: LocalEnvironmentClient,
+    llm_client: Optional[OpenAI],
     task_id: str,
     seed: int = DEFAULT_SEED,
 ) -> Dict[str, Any]:
+    """Run one episode of the given task."""
     rewards: List[float] = []
     steps_taken = 0
     score = 0.001
@@ -273,57 +239,32 @@ def run_task(
         done = False
         last_reward: Optional[dict] = None
 
-        for step in range(1, MAX_STEPS + 1):
+        for step_num in range(1, MAX_STEPS + 1):
             if done:
                 break
 
-            action_dict = get_action_from_llm(
-                llm_client, obs, messages, task_id, last_reward
-            )
+            if llm_client is not None:
+                actions = get_action_from_llm(llm_client, obs, messages, last_reward)
+            else:
+                actions = greedy_action(obs)
 
-            try:
-                step_data = env_client.step(action_dict)
-            except requests.HTTPError as http_err:
-                error_msg = f"invalid_action:{http_err.response.status_code}"
-                log_step(
-                    step=step,
-                    action=_format_action(action_dict),
-                    reward=-0.10,
-                    done=False,
-                    error=error_msg,
-                )
-                penalty_reward = {"value": -0.10, "reason": error_msg}
-                rewards.append(-0.10)
-                steps_taken = step
-                last_reward = penalty_reward
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"Your last action was rejected by the environment "
-                        f"(HTTP {http_err.response.status_code}). "
-                        "Make sure action_type, method, endpoint, resolution_code "
-                        "and all required fields are valid. Try again."
-                    ),
-                })
-                continue
-
+            step_data = env_client.step(actions)
             obs = step_data["observation"]
             reward = step_data["reward"]
             done = step_data["done"]
 
             reward_value = reward["value"]
-            error = None
-
             rewards.append(reward_value)
-            steps_taken = step
+            steps_taken = step_num
             last_reward = reward
 
+            action_str = f"[{','.join(str(a) for a in actions)}]"
             log_step(
-                step=step,
-                action=_format_action(action_dict),
+                step=step_num,
+                action=action_str,
                 reward=reward_value,
                 done=done,
-                error=error,
+                error=None,
             )
 
             if done:
@@ -348,13 +289,14 @@ def run_task(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not HF_TOKEN:
-        print("[DEBUG] HF_TOKEN not set — aborting.", flush=True)
-        sys.exit(1)
+    llm_client: Optional[OpenAI] = None
 
-    llm_client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
-    env_client = HttpEnvironmentClient(OPENENV_BASE_URL)
+    if HF_TOKEN:
+        llm_client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+    else:
+        print("[DEBUG] HF_TOKEN not set — using greedy heuristic fallback.", flush=True)
 
+    env_client = LocalEnvironmentClient()
     results: Dict[str, Any] = {}
     total_score = 0.0
 

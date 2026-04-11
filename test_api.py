@@ -20,7 +20,7 @@ class TestHealthAndMetadata:
         assert r.status_code == 200
         data = r.json()
         assert data["status"] == "ok"
-        assert "version" in data
+        assert data["environment"] == "EVChargingScheduler"
 
     def test_health(self, client):
         r = client.get("/health")
@@ -32,6 +32,7 @@ class TestHealthAndMetadata:
         assert r.status_code == 200
         body = r.json()
         assert "name" in body
+        assert body["name"] == "EVChargingScheduler"
         assert "description" in body
 
     def test_schema_returns_all_keys(self, client):
@@ -73,39 +74,45 @@ class TestResetStepState:
         r = client.post("/reset", json={"task_id": "easy", "seed": 42})
         assert r.status_code == 200
         body = r.json()
-        assert body["ticket_id"] != ""
         assert body["step_count"] == 0
-        assert body["max_steps"] == 20
+        assert body["max_steps"] == 48
+        assert body["num_ports"] == 4
+        assert len(body["state"]) == 5 * 4 + 4  # 5*N + 4
 
     def test_reset_defaults_to_easy(self, client):
         r = client.post("/reset")
         assert r.status_code == 200
-        assert r.json()["ticket_id"] != ""
+        assert r.json()["num_ports"] == 4
 
     def test_state_reflects_reset(self, client):
         client.post("/reset", json={"task_id": "medium", "seed": 42})
         r = client.get("/state")
         assert r.status_code == 200
         body = r.json()
-        assert "refund" in body["customer_request"].lower() or "return" in body["customer_request"].lower()
+        assert body["num_ports"] == 6
 
     def test_step_returns_full_response(self, client):
         client.post("/reset", json={"task_id": "easy", "seed": 42})
-        r = client.post("/step", json={
-            "action_type": "call_api",
-            "method": "GET",
-            "endpoint": "/policies",
-        })
+        r = client.post("/step", json={"actions": [0, 0, 0, 0]})
         assert r.status_code == 200
         body = r.json()
         for key in ("observation", "reward", "done", "info"):
             assert key in body
         assert body["done"] is False
 
-    def test_step_rejects_invalid_action_type(self, client):
+    def test_step_with_charging(self, client):
         client.post("/reset", json={"task_id": "easy", "seed": 42})
-        r = client.post("/step", json={"action_type": "fly_to_moon"})
-        assert r.status_code == 422
+        r = client.post("/step", json={"actions": [3, 3, 3, 3]})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["observation"]["step_count"] == 1
+        assert "breakdown" in body["reward"]
+
+    def test_step_action_validation(self, client):
+        """Actions with out-of-range values should be clamped, not rejected."""
+        client.post("/reset", json={"task_id": "easy", "seed": 42})
+        r = client.post("/step", json={"actions": [5, -1, 3, 0]})
+        assert r.status_code == 200  # Clamped, not rejected
 
 
 class TestGraderEndpoint:
@@ -115,87 +122,63 @@ class TestGraderEndpoint:
         assert r.status_code == 200
         assert r.json()["score"] == 0.001
 
-    def test_grader_after_close(self, client):
+    def test_grader_after_episode(self, client):
         client.post("/reset", json={"task_id": "easy", "seed": 42})
-        client.post("/step", json={
-            "action_type": "close_ticket",
-            "resolution": "Done.",
-            "resolution_code": "resolved",
-        })
+        # Step until done
+        for _ in range(48):
+            r = client.post("/step", json={"actions": [3, 3, 3, 3]})
+            if r.json()["done"]:
+                break
         r = client.get("/grader")
         assert r.status_code == 200
         body = r.json()
-        assert 0.0 <= body["score"] <= 1.0
+        assert 0.0 < body["score"] <= 1.0
         assert "breakdown" in body
 
 
 class TestFullEpisodeFlow:
     def test_easy_episode(self, client):
+        """Run a full easy episode with aggressive charging."""
         client.post("/reset", json={"task_id": "easy", "seed": 42})
+        done = False
+        steps = 0
+        while not done and steps < 48:
+            r = client.post("/step", json={"actions": [3, 3, 3, 3]})
+            body = r.json()
+            done = body["done"]
+            steps += 1
+            assert r.status_code == 200
 
-        r = client.post("/step", json={
-            "action_type": "call_api", "method": "GET", "endpoint": "/policies",
-        })
-        assert r.json()["done"] is False
+        grade = client.get("/grader").json()
+        assert grade["score"] > 0.3
 
-        r = client.post("/step", json={
-            "action_type": "send_message",
-            "message": "Let me check your order for you.",
-        })
-        assert r.json()["observation"]["last_customer_reply"] is not None
-
-        r = client.post("/step", json={
-            "action_type": "close_ticket",
-            "resolution": "Resolved.",
-            "resolution_code": "info_provided",
-        })
-        assert r.json()["done"] is True
+    def test_medium_episode_with_varied_actions(self, client):
+        """Run a medium episode with varied charging levels."""
+        client.post("/reset", json={"task_id": "medium", "seed": 42})
+        done = False
+        steps = 0
+        while not done and steps < 48:
+            # Alternate between HIGH and LOW
+            level = 3 if steps % 2 == 0 else 1
+            r = client.post("/step", json={"actions": [level] * 6})
+            done = r.json()["done"]
+            steps += 1
 
         grade = client.get("/grader").json()
         assert 0.0 < grade["score"] <= 1.0
 
-    def test_hard_episode_with_research(self, client):
-        """Full hard episode with policy + KB produces high score."""
-        client.post("/reset", json={"task_id": "hard", "seed": 7})
-
-        for action in [
-            {"action_type": "call_api", "method": "GET", "endpoint": "/orders/O-302"},
-            {"action_type": "call_api", "method": "GET", "endpoint": "/customers/C-140"},
-            {"action_type": "call_api", "method": "GET", "endpoint": "/policies"},
-            {"action_type": "call_api", "method": "GET", "endpoint": "/knowledge_base?q=fraud"},
-            {"action_type": "send_message", "message": "Your refund has been denied per policy."},
-        ]:
-            r = client.post("/step", json=action)
-            assert r.status_code == 200
-
-        r = client.post("/step", json={
-            "action_type": "close_ticket",
-            "resolution": "Denied — fraud-flagged per policy.",
-            "resolution_code": "denied",
-        })
-        assert r.json()["done"] is True
+    def test_hard_episode(self, client):
+        """Run a hard episode."""
+        client.post("/reset", json={"task_id": "hard", "seed": 42})
+        done = False
+        steps = 0
+        while not done and steps < 48:
+            r = client.post("/step", json={"actions": [2] * 8})
+            done = r.json()["done"]
+            steps += 1
 
         grade = client.get("/grader").json()
-        assert grade["score"] == 0.999
-
-    def test_hard_episode_without_research_is_capped(self, client):
-        """Hard episode without policy/KB consultation is capped below 0.50."""
-        client.post("/reset", json={"task_id": "hard", "seed": 7})
-
-        client.post("/step", json={
-            "action_type": "call_api", "method": "GET", "endpoint": "/orders/O-302",
-        })
-        client.post("/step", json={
-            "action_type": "send_message", "message": "Denied.",
-        })
-        client.post("/step", json={
-            "action_type": "close_ticket",
-            "resolution": "Denied.",
-            "resolution_code": "denied",
-        })
-
-        grade = client.get("/grader").json()
-        assert grade["score"] < 0.50
+        assert 0.0 < grade["score"] <= 1.0
 
 
 class TestSessionIsolation:
@@ -209,5 +192,18 @@ class TestSessionIsolation:
         s1 = c1.get("/state").json()
         s2 = c2.get("/state").json()
 
-        assert s1["ticket_id"] != s2["ticket_id"]
-        assert s1["priority"] != s2["priority"] or s1["customer_request"] != s2["customer_request"]
+        assert s1["num_ports"] != s2["num_ports"]
+
+
+class TestActionMaskInResponse:
+    def test_reset_includes_action_mask(self, client):
+        r = client.post("/reset", json={"task_id": "easy", "seed": 42})
+        body = r.json()
+        assert "action_mask" in body
+        assert len(body["action_mask"]) == 4  # 4 ports
+
+    def test_step_includes_updated_mask(self, client):
+        client.post("/reset", json={"task_id": "easy", "seed": 42})
+        r = client.post("/step", json={"actions": [3, 3, 3, 3]})
+        body = r.json()
+        assert "action_mask" in body["observation"]

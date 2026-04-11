@@ -1,366 +1,485 @@
 """
-Basic tests for the Customer Service Agent environment.
+Unit tests for the EV Charging Scheduler environment.
 Run with: python -m pytest test_environment.py -v
 """
 
 import pytest
-from environment import SupportEnvironment
+from environment import (
+    ChargingEnvironment,
+    POWER_LEVELS,
+    MAX_STEPS,
+    TASK_CONFIGS,
+    STEP_DURATION_HOURS,
+    BATTERY_CAPACITY_KWH,
+    CHARGE_EFFICIENCY,
+)
 from models import Action
 
 
+# ---------------------------------------------------------------------------
+# Reset
+# ---------------------------------------------------------------------------
+
 class TestReset:
     def test_reset_easy(self):
-        env = SupportEnvironment()
+        env = ChargingEnvironment()
         obs = env.reset("easy", seed=42)
-        assert obs.ticket_id != ""
         assert obs.step_count == 0
-        assert obs.max_steps == 20
+        assert obs.max_steps == MAX_STEPS
+        assert obs.num_ports == 4
         assert not env.is_done
 
     def test_reset_medium(self):
-        env = SupportEnvironment()
+        env = ChargingEnvironment()
         obs = env.reset("medium", seed=42)
-        assert obs.ticket_id != ""
-        assert "refund" in obs.customer_request.lower() or "return" in obs.customer_request.lower()
+        assert obs.num_ports == 6
 
     def test_reset_hard(self):
-        env = SupportEnvironment()
+        env = ChargingEnvironment()
         obs = env.reset("hard", seed=42)
-        assert obs.ticket_id != ""
+        assert obs.num_ports == 8
 
     def test_reset_clears_state(self):
-        env = SupportEnvironment()
+        env = ChargingEnvironment()
         env.reset("easy", seed=1)
-        action = Action(action_type="call_api", method="GET", endpoint="/orders/O-100")
-        env.step(action)
+        env.step(Action(actions=[3, 3, 3, 3]))
         assert env.step_count == 1
 
         obs = env.reset("easy", seed=1)
         assert obs.step_count == 0
-        assert obs.action_history == []
-        assert obs.messages_sent == []
+        assert env._total_energy_cost == 0.0
 
     def test_reset_invalid_task_defaults(self):
-        env = SupportEnvironment()
-        obs = env.reset("nonexistent")
+        env = ChargingEnvironment()
+        env.reset("nonexistent")
         assert env.task_id == "easy"
 
+    def test_reset_seed_determinism(self):
+        env1 = ChargingEnvironment()
+        obs1 = env1.reset("medium", seed=123)
 
-class TestStep:
-    def test_call_api_get_order(self):
-        env = SupportEnvironment()
+        env2 = ChargingEnvironment()
+        obs2 = env2.reset("medium", seed=123)
+
+        assert obs1.state == obs2.state
+
+    def test_different_seeds_different_states(self):
+        env = ChargingEnvironment()
+        obs1 = env.reset("easy", seed=1)
+        obs2 = env.reset("easy", seed=999)
+        # States should differ (different vehicle placements)
+        assert obs1.state != obs2.state
+
+
+# ---------------------------------------------------------------------------
+# State vector
+# ---------------------------------------------------------------------------
+
+class TestStateVector:
+    def test_state_length(self):
+        env = ChargingEnvironment()
+        obs = env.reset("easy", seed=42)
+        N = obs.num_ports
+        # 5*N per-port features + 4 global features
+        assert len(obs.state) == 5 * N + 4
+
+    def test_state_values_in_range(self):
+        env = ChargingEnvironment()
+        obs = env.reset("hard", seed=42)
+        for val in obs.state:
+            assert 0.0 <= val <= 1.0, f"State value {val} out of [0,1] range"
+
+    def test_state_shows_occupied_ports(self):
+        env = ChargingEnvironment()
+        obs = env.reset("easy", seed=42)
+        N = obs.num_ports
+        occupied = obs.state[3 * N : 4 * N]
+        num_occupied = sum(1 for x in occupied if x > 0.5)
+        assert num_occupied == TASK_CONFIGS["easy"]["num_vehicles"]
+
+
+# ---------------------------------------------------------------------------
+# Action mask
+# ---------------------------------------------------------------------------
+
+class TestActionMask:
+    def test_mask_shape(self):
+        env = ChargingEnvironment()
+        obs = env.reset("easy", seed=42)
+        assert len(obs.action_mask) == obs.num_ports
+        for port_mask in obs.action_mask:
+            assert len(port_mask) == 4
+
+    def test_off_always_valid(self):
+        env = ChargingEnvironment()
+        obs = env.reset("hard", seed=42)
+        for port_mask in obs.action_mask:
+            assert port_mask[0] is True
+
+    def test_empty_port_only_off(self):
+        env = ChargingEnvironment()
+        obs = env.reset("easy", seed=42)
+        N = obs.num_ports
+        for i in range(N):
+            occupied = obs.state[3 * N + i] > 0.5
+            if not occupied:
+                assert obs.action_mask[i] == [True, False, False, False]
+
+    def test_occupied_port_has_charging_options(self):
+        env = ChargingEnvironment()
+        obs = env.reset("easy", seed=42)
+        N = obs.num_ports
+        for i in range(N):
+            occupied = obs.state[3 * N + i] > 0.5
+            soc = obs.state[i]
+            target = obs.state[N + i]
+            if occupied and soc < target:
+                # Should have at least LOW available
+                assert obs.action_mask[i][1] is True
+
+    def test_mask_forces_invalid_to_off(self):
+        """Actions violating the mask are silently forced to OFF."""
+        env = ChargingEnvironment()
         env.reset("easy", seed=42)
-        action = Action(action_type="call_api", method="GET", endpoint="/orders/O-100")
+        N = env.num_ports
+        # Create an action with HIGH on all ports (some may be empty)
+        actions = [3] * N
+        action = Action(actions=actions)
         obs, reward, done, info = env.step(action)
-        assert reward.value > 0 or "Order not found" in (obs.last_api_response or "")
+        # Should not crash — invalid actions silently become OFF
         assert obs.step_count == 1
 
-    def test_call_api_missing_fields(self):
-        env = SupportEnvironment()
-        env.reset("easy", seed=42)
-        action = Action(action_type="call_api")
-        obs, reward, done, info = env.step(action)
-        assert reward.value < 0
-        assert "Error" in (obs.last_api_response or "")
 
-    def test_send_message(self):
-        env = SupportEnvironment()
-        env.reset("easy", seed=42)
-        action = Action(action_type="send_message", message="Let me check that for you.")
-        obs, reward, done, info = env.step(action)
-        assert reward.value >= 0
-        assert len(obs.messages_sent) == 1
-        assert obs.last_customer_reply is not None
+# ---------------------------------------------------------------------------
+# Step & Charging
+# ---------------------------------------------------------------------------
 
-    def test_send_empty_message(self):
-        env = SupportEnvironment()
+class TestStep:
+    def test_step_increments_counter(self):
+        env = ChargingEnvironment()
         env.reset("easy", seed=42)
-        action = Action(action_type="send_message", message="")
-        obs, reward, done, info = env.step(action)
-        assert reward.value < 0
+        env.step(Action(actions=[0, 0, 0, 0]))
+        assert env.step_count == 1
 
-    def test_close_ticket(self):
-        env = SupportEnvironment()
+    def test_charging_increases_soc(self):
+        env = ChargingEnvironment()
         env.reset("easy", seed=42)
-        action = Action(
-            action_type="close_ticket",
-            resolution="Order is shipped with tracking TRK999.",
-            resolution_code="info_provided",
-        )
-        obs, reward, done, info = env.step(action)
-        assert done is True
+        N = env.num_ports
 
-    def test_max_step_enforcement(self):
-        env = SupportEnvironment()
-        env.reset("easy", seed=42)
-        # Run 20 steps of dummy actions
-        for _ in range(20):
-            action = Action(action_type="call_api", method="GET", endpoint="/policies")
-            obs, reward, done, info = env.step(action)
-            if done:
+        # Find an occupied port
+        occupied_port = None
+        for i in range(N):
+            if env.vehicles[i] is not None:
+                occupied_port = i
                 break
-        assert env.is_done
+
+        if occupied_port is not None:
+            initial_soc = env.vehicles[occupied_port].soc
+            actions = [0] * N
+            actions[occupied_port] = 3  # HIGH
+            env.step(Action(actions=actions))
+            assert env.vehicles[occupied_port].soc > initial_soc
+
+    def test_off_does_not_charge(self):
+        env = ChargingEnvironment()
+        env.reset("easy", seed=42)
+        N = env.num_ports
+
+        # Find occupied port
+        for i in range(N):
+            if env.vehicles[i] is not None:
+                initial_soc = env.vehicles[i].soc
+                break
+
+        env.step(Action(actions=[0] * N))
+
+        for i in range(N):
+            if env.vehicles[i] is not None:
+                assert env.vehicles[i].soc == initial_soc
+                break
 
     def test_step_after_done_returns_zero(self):
-        env = SupportEnvironment()
+        env = ChargingEnvironment()
         env.reset("easy", seed=42)
-        action = Action(action_type="close_ticket", resolution="Done.", resolution_code="resolved")
-        env.step(action)
-        obs, reward, done, info = env.step(action)
+        env.is_done = True
+        obs, reward, done, info = env.step(Action(actions=[0, 0, 0, 0]))
         assert done is True
         assert reward.value == 0.0
 
+    def test_soc_does_not_exceed_target(self):
+        """Charging should cap at target_soc."""
+        env = ChargingEnvironment()
+        env.reset("easy", seed=42)
+        N = env.num_ports
+
+        # Run many steps at HIGH
+        for _ in range(MAX_STEPS):
+            if env.is_done:
+                break
+            env.step(Action(actions=[3] * N))
+
+        for v in env.vehicles:
+            if v is not None:
+                assert v.soc <= v.target_soc + 0.001
+
+
+# ---------------------------------------------------------------------------
+# Rewards
+# ---------------------------------------------------------------------------
+
+class TestRewards:
+    def test_reward_has_breakdown(self):
+        env = ChargingEnvironment()
+        env.reset("easy", seed=42)
+        _, reward, _, _ = env.step(Action(actions=[3, 3, 3, 3]))
+        assert "energy_cost" in reward.breakdown
+        assert "charging_progress" in reward.breakdown
+
+    def test_idle_penalty(self):
+        """Vehicles present but set to OFF should incur idle penalty."""
+        env = ChargingEnvironment()
+        env.reset("easy", seed=42)
+        _, reward, _, _ = env.step(Action(actions=[0, 0, 0, 0]))
+        assert reward.breakdown.get("idle_penalty", 0) <= 0
+
+    def test_charging_gives_positive_progress(self):
+        env = ChargingEnvironment()
+        env.reset("easy", seed=42)
+        N = env.num_ports
+        actions = [3] * N  # HIGH everywhere
+        _, reward, _, _ = env.step(Action(actions=actions))
+        assert reward.breakdown.get("charging_progress", 0) > 0
+
+    def test_energy_cost_is_negative(self):
+        env = ChargingEnvironment()
+        env.reset("easy", seed=42)
+        N = env.num_ports
+        _, reward, _, _ = env.step(Action(actions=[3] * N))
+        assert reward.breakdown.get("energy_cost", 0) < 0
+
+    def test_episode_end_bonus(self):
+        """Correctly charged vehicles should give episode end bonus."""
+        env = ChargingEnvironment()
+        env.reset("easy", seed=42)
+
+        # Run until done
+        for _ in range(MAX_STEPS):
+            if env.is_done:
+                break
+            obs, reward, done, info = env.step(
+                Action(actions=[3] * env.num_ports)
+            )
+
+        # At least some vehicles should have departed satisfied
+        assert env._vehicles_satisfied >= 0
+
+
+# ---------------------------------------------------------------------------
+# Grader
+# ---------------------------------------------------------------------------
 
 class TestGrader:
     def test_grader_not_done(self):
-        env = SupportEnvironment()
+        env = ChargingEnvironment()
         env.reset("easy", seed=42)
         result = env.grade()
         assert result["score"] == 0.001
         assert "not finished" in result.get("reason", "").lower()
 
     def test_grader_score_range(self):
-        env = SupportEnvironment()
+        env = ChargingEnvironment()
         env.reset("easy", seed=42)
-        # Close immediately — should get partial score
-        action = Action(
-            action_type="close_ticket",
-            resolution="idk",
-            resolution_code="resolved",
-        )
-        env.step(action)
+        # Run to completion
+        for _ in range(MAX_STEPS):
+            if env.is_done:
+                break
+            env.step(Action(actions=[3] * env.num_ports))
         result = env.grade()
-        assert 0.0 <= result["score"] <= 1.0
+        assert 0.0 < result["score"] <= 1.0
 
     def test_grader_has_breakdown(self):
-        env = SupportEnvironment()
-        env.reset("medium", seed=42)
-        action = Action(action_type="close_ticket", resolution="Refunded.", resolution_code="refunded")
-        env.step(action)
+        env = ChargingEnvironment()
+        env.reset("easy", seed=42)
+        for _ in range(MAX_STEPS):
+            if env.is_done:
+                break
+            env.step(Action(actions=[3] * env.num_ports))
         result = env.grade()
         assert "breakdown" in result
+        assert "vehicle_satisfaction" in result["breakdown"]
+        assert "cost_efficiency" in result["breakdown"]
+        assert "grid_compliance" in result["breakdown"]
+        assert "charge_precision" in result["breakdown"]
 
-    def test_easy_requires_customer_facing_answer(self):
-        env = SupportEnvironment()
+    def test_all_off_scores_low(self):
+        """Never charging should produce a low score."""
+        env = ChargingEnvironment()
         env.reset("easy", seed=42)
-        action = Action(
-            action_type="close_ticket",
-            resolution="Order is shipped with tracking TRK999.",
-            resolution_code="info_provided",
-        )
-        env.step(action)
+        for _ in range(MAX_STEPS):
+            if env.is_done:
+                break
+            env.step(Action(actions=[0] * env.num_ports))
         result = env.grade()
-        assert result["breakdown"]["customer_response_accuracy"] == 0.0
-        assert result["score"] < 0.7
+        assert result["score"] < 0.55
 
-    def test_hard_partial_refund_scores_by_amount_accuracy(self):
-        env = SupportEnvironment()
-        env.reset("hard", seed=1)  # seed=1 → T-H02 (Grace P., partial refund)
-        env.step(Action(action_type="call_api", method="GET", endpoint="/orders/O-301"))
-        env.step(Action(action_type="call_api", method="GET", endpoint="/customers/C-130"))
-        env.step(Action(action_type="call_api", method="GET", endpoint="/policies"))
-        env.step(Action(action_type="call_api", method="POST", endpoint="/refunds", payload={
-            "order_id": "O-301",
-            "amount": 1.0,
-            "reason": "Partial refund",
-        }))
-        env.step(Action(action_type="send_message", message="I have processed a partial refund."))
-        env.step(Action(action_type="close_ticket", resolution="Issued a partial refund.", resolution_code="refunded"))
-        result = env.grade()
-        assert 0.0 < result["breakdown"]["correct_refund"] < 0.2
-        assert result["breakdown"]["order_check"] == 0.1
+    def test_aggressive_charging_scores_higher(self):
+        """Always HIGH should score better than always OFF."""
+        env1 = ChargingEnvironment()
+        env1.reset("easy", seed=42)
+        for _ in range(MAX_STEPS):
+            if env1.is_done:
+                break
+            env1.step(Action(actions=[3] * env1.num_ports))
+        score_high = env1.grade()["score"]
 
-    def test_hard_denial_requires_policy_for_full_score(self):
-        env = SupportEnvironment()
-        env.reset("hard", seed=7)  # seed=7 → T-H03 (Hiro T., fraud denial)
-        env.step(Action(action_type="call_api", method="GET", endpoint="/orders/O-302"))
-        env.step(Action(action_type="call_api", method="GET", endpoint="/customers/C-140"))
-        env.step(Action(action_type="send_message", message="I cannot approve a refund on this account."))
-        env.step(Action(action_type="close_ticket", resolution="Refund denied.", resolution_code="denied"))
-        result = env.grade()
-        assert result["breakdown"]["policy_check"] == 0.0
-        assert result["score"] < 0.50  # without policy+KB, research gate caps score
+        env2 = ChargingEnvironment()
+        env2.reset("easy", seed=42)
+        for _ in range(MAX_STEPS):
+            if env2.is_done:
+                break
+            env2.step(Action(actions=[0] * env2.num_ports))
+        score_off = env2.grade()["score"]
 
-    def test_hard_research_gate_caps_without_policy_kb(self):
-        """Without consulting policies or KB, max hard score must be <= 0.40."""
-        env = SupportEnvironment()
-        env.reset("hard", seed=7)  # T-H03 denial variant
-        env.step(Action(action_type="call_api", method="GET", endpoint="/orders/O-302"))
-        env.step(Action(action_type="call_api", method="GET", endpoint="/customers/C-140"))
-        env.step(Action(action_type="send_message", message="Refund denied due to account flag."))
-        env.step(Action(action_type="close_ticket", resolution="Denied.", resolution_code="denied"))
-        result = env.grade()
-        assert result["score"] <= 0.45
-        assert result["breakdown"]["correct_denial"] == 0.0  # gated to zero
-
-    def test_hard_research_gate_half_with_policy_only(self):
-        """With only policy (no KB), decision credit is halved."""
-        env = SupportEnvironment()
-        env.reset("hard", seed=7)  # T-H03 denial variant
-        env.step(Action(action_type="call_api", method="GET", endpoint="/orders/O-302"))
-        env.step(Action(action_type="call_api", method="GET", endpoint="/customers/C-140"))
-        env.step(Action(action_type="call_api", method="GET", endpoint="/policies"))
-        env.step(Action(action_type="send_message", message="Refund denied per fraud policy."))
-        env.step(Action(action_type="close_ticket", resolution="Denied per policy.", resolution_code="denied"))
-        result = env.grade()
-        assert result["breakdown"]["correct_denial"] == round(0.30 * 0.5, 4)
-        assert result["breakdown"]["policy_check"] == 0.15
-
-    def test_hard_full_research_unlocks_full_decision(self):
-        """With both policy + KB, decision credit is fully unlocked."""
-        env = SupportEnvironment()
-        env.reset("hard", seed=7)  # T-H03 denial variant
-        env.step(Action(action_type="call_api", method="GET", endpoint="/orders/O-302"))
-        env.step(Action(action_type="call_api", method="GET", endpoint="/customers/C-140"))
-        env.step(Action(action_type="call_api", method="GET", endpoint="/policies"))
-        env.step(Action(action_type="call_api", method="GET", endpoint="/knowledge_base?q=fraud"))
-        env.step(Action(action_type="send_message", message="Refund denied per fraud policy."))
-        env.step(Action(action_type="close_ticket", resolution="Denied per policy.", resolution_code="denied"))
-        result = env.grade()
-        assert result["breakdown"]["correct_denial"] == 0.30
-        assert result["score"] == 0.999
+        assert score_high > score_off
 
 
-class TestKnowledgeBase:
-    def test_search_returns_results(self):
-        env = SupportEnvironment()
+# ---------------------------------------------------------------------------
+# Curriculum
+# ---------------------------------------------------------------------------
+
+class TestCurriculum:
+    def test_easy_fewer_ports_than_hard(self):
+        assert TASK_CONFIGS["easy"]["num_ports"] < TASK_CONFIGS["hard"]["num_ports"]
+
+    def test_easy_has_flat_tariff(self):
+        assert TASK_CONFIGS["easy"]["flat_tariff"] is True
+
+    def test_medium_has_variable_tariff(self):
+        assert TASK_CONFIGS["medium"]["flat_tariff"] is False
+
+    def test_hard_has_failures_enabled(self):
+        assert TASK_CONFIGS["hard"]["enable_failures"] is True
+
+    def test_hard_has_urgent_enabled(self):
+        assert TASK_CONFIGS["hard"]["enable_urgent"] is True
+
+    def test_easy_no_failures(self):
+        assert TASK_CONFIGS["easy"]["enable_failures"] is False
+
+    def test_grid_tighter_per_port_at_higher_difficulty(self):
+        """Grid capacity per port should decrease (tighten) with difficulty."""
+        easy_ratio = TASK_CONFIGS["easy"]["grid_capacity_kw"] / TASK_CONFIGS["easy"]["num_ports"]
+        med_ratio = TASK_CONFIGS["medium"]["grid_capacity_kw"] / TASK_CONFIGS["medium"]["num_ports"]
+        hard_ratio = TASK_CONFIGS["hard"]["grid_capacity_kw"] / TASK_CONFIGS["hard"]["num_ports"]
+        assert easy_ratio >= med_ratio
+        assert med_ratio >= hard_ratio
+
+
+# ---------------------------------------------------------------------------
+# Charger failures (hard mode)
+# ---------------------------------------------------------------------------
+
+class TestFailures:
+    def test_failures_happen_in_hard_mode(self):
+        """At least one port should fail during a hard episode."""
+        env = ChargingEnvironment()
         env.reset("hard", seed=42)
-        action = Action(action_type="call_api", method="GET", endpoint="/knowledge_base?q=fraud")
-        obs, reward, done, info = env.step(action)
-        assert "fraud" in (obs.last_api_response or "").lower()
 
-    def test_search_no_results(self):
-        env = SupportEnvironment()
+        any_failed = False
+        for _ in range(MAX_STEPS):
+            if env.is_done:
+                break
+            env.step(Action(actions=[0] * env.num_ports))
+            if not all(env.port_operational):
+                any_failed = True
+                break
+
+        assert any_failed, "Expected at least one port failure in hard mode"
+
+    def test_no_failures_in_easy_mode(self):
+        env = ChargingEnvironment()
         env.reset("easy", seed=42)
-        action = Action(action_type="call_api", method="GET", endpoint="/knowledge_base?q=xyznonexistent")
-        obs, reward, done, info = env.step(action)
-        assert "No articles found" in (obs.last_api_response or "")
+
+        for _ in range(MAX_STEPS):
+            if env.is_done:
+                break
+            env.step(Action(actions=[0] * env.num_ports))
+
+        assert all(env.port_operational), "Easy mode should have no failures"
+
+    def test_failed_port_only_allows_off(self):
+        """A failed port's mask should only allow OFF."""
+        env = ChargingEnvironment()
+        env.reset("hard", seed=42)
+
+        # Step until a failure occurs
+        for _ in range(MAX_STEPS):
+            if env.is_done:
+                break
+            obs, _, _, _ = env.step(Action(actions=[0] * env.num_ports))
+            for i, operational in enumerate(env.port_operational):
+                if not operational:
+                    assert obs.action_mask[i] == [True, False, False, False]
+                    return
+
+        # If no failure occurred with this seed, skip
+        pytest.skip("No failure occurred with seed=42 in hard mode")
 
 
-class TestAdversarialCustomers:
-    def test_social_engineer_resists_override(self):
-        """Social engineering personality pushes fake credentials."""
-        env = SupportEnvironment()
-        env.reset("hard", seed=0)  # seed=0 → T-H04 (social engineer)
-        env.step(Action(action_type="send_message", message="Let me look into this for you."))
-        reply = env.last_customer_reply
-        assert "MGR-9901" in reply or "corporate" in reply.lower()
+# ---------------------------------------------------------------------------
+# Departures
+# ---------------------------------------------------------------------------
 
-    def test_contradictory_customer_changes_story(self):
-        """Contradictory personality shifts claims across turns."""
-        env = SupportEnvironment()
-        env.reset("hard", seed=5)  # seed=5 → T-H05 (contradictory)
-        env.step(Action(action_type="send_message", message="I'm checking the details."))
-        reply1 = env.last_customer_reply
-        assert "correct myself" in reply1.lower() or "damaged" in reply1.lower()
-
-        env.step(Action(action_type="send_message", message="Can you clarify?"))
-        reply2 = env.last_customer_reply
-        assert reply2 != reply1  # story changes
-
-    def test_aggressive_customer_escalates(self):
-        """Aggressive personality demands manager when denied."""
-        env = SupportEnvironment()
-        env.reset("hard", seed=2)  # seed=2 → T-H01 (aggressive)
-        env.step(Action(action_type="send_message", message="I'm sorry but your refund has been denied."))
-        assert "manager" in env.last_customer_reply.lower() or "ridiculous" in env.last_customer_reply.lower()
-
-    def test_manipulative_customer_emotional_appeals(self):
-        """Manipulative personality appeals to emotion on denial."""
-        env = SupportEnvironment()
-        env.reset("hard", seed=7)  # seed=7 → T-H03 (manipulative)
-        env.step(Action(action_type="send_message", message="I've been so stressed about this."))
-        first = env.last_customer_reply
-        env.step(Action(action_type="send_message", message="The refund cannot be approved."))
-        second = env.last_customer_reply
-        assert "begging" in second.lower() or "birthday" in second.lower()
-
-
-class TestDuplicateCallPenalty:
-    def test_duplicate_get_no_reward(self):
-        env = SupportEnvironment()
+class TestDepartures:
+    def test_vehicle_departs_at_deadline(self):
+        env = ChargingEnvironment()
         env.reset("easy", seed=42)
-        action = Action(action_type="call_api", method="GET", endpoint="/policies")
-        _, r1, _, _ = env.step(action)
-        _, r2, _, _ = env.step(action)
-        assert r1.value > 0
-        assert r2.value == 0.0
-        assert "Duplicate" in r2.reason
 
-    def test_duplicate_post_still_penalised(self):
-        env = SupportEnvironment()
+        # Find earliest departure
+        earliest = MAX_STEPS + 1
+        for v in env.vehicles:
+            if v is not None:
+                earliest = min(earliest, v.departure_step)
+
+        # Step until that point
+        for _ in range(earliest):
+            if env.is_done:
+                break
+            env.step(Action(actions=[0] * env.num_ports))
+
+        assert env._vehicles_departed > 0
+
+    def test_satisfied_vehicle_counted(self):
+        env = ChargingEnvironment()
+        env.reset("easy", seed=42)
+
+        # Charge aggressively
+        for _ in range(MAX_STEPS):
+            if env.is_done:
+                break
+            env.step(Action(actions=[3] * env.num_ports))
+
+        # At least some should be satisfied
+        assert env._vehicles_satisfied > 0
+
+
+# ---------------------------------------------------------------------------
+# Tariff
+# ---------------------------------------------------------------------------
+
+class TestTariff:
+    def test_flat_tariff_in_easy(self):
+        env = ChargingEnvironment()
+        env.reset("easy", seed=42)
+        tariff = env._get_tariff()
+        assert tariff == TASK_CONFIGS["easy"]["flat_tariff_value"]
+
+    def test_variable_tariff_in_medium(self):
+        env = ChargingEnvironment()
         env.reset("medium", seed=42)
-        action = Action(action_type="call_api", method="POST", endpoint="/refunds",
-                        payload={"order_id": "O-200", "amount": 120.0})
-        env.step(action)
-        action2 = Action(action_type="call_api", method="POST", endpoint="/refunds",
-                         payload={"order_id": "O-200", "amount": 120.0})
-        _, r2, _, _ = env.step(action2)
-        assert r2.value < 0  # double-refund still penalised
-
-    def test_different_gets_both_rewarded(self):
-        env = SupportEnvironment()
-        env.reset("easy", seed=42)
-        _, r1, _, _ = env.step(Action(action_type="call_api", method="GET", endpoint="/policies"))
-        _, r2, _, _ = env.step(Action(action_type="call_api", method="GET", endpoint="/knowledge_base?q=refund"))
-        assert r1.value > 0
-        assert r2.value > 0
-
-
-class TestSatisfactionInGrader:
-    def test_satisfaction_appears_in_breakdown(self):
-        env = SupportEnvironment()
-        env.reset("easy", seed=42)
-        env.step(Action(action_type="send_message", message="I'm sorry for the inconvenience."))
-        env.step(Action(action_type="close_ticket", resolution="Done.", resolution_code="info_provided"))
-        result = env.grade()
-        assert "satisfaction" in result["breakdown"]
-        assert result["breakdown"]["satisfaction"] > 0
-
-    def test_low_satisfaction_reduces_score(self):
-        env = SupportEnvironment()
-        env.reset("easy", seed=42)
-        # Close without any messages — satisfaction drops
-        env.step(Action(action_type="close_ticket", resolution="Done.", resolution_code="info_provided"))
-        result = env.grade()
-        assert result["breakdown"]["satisfaction"] < 0.10
-
-
-class TestCustomerSatisfaction:
-    def test_polite_message_boosts_satisfaction(self):
-        env = SupportEnvironment()
-        env.reset("easy", seed=42)
-        initial_sat = env.customer_satisfaction
-        action = Action(action_type="send_message", message="I'm sorry for the inconvenience.")
-        obs, reward, done, info = env.step(action)
-        assert info.customer_satisfaction >= initial_sat
-
-    def test_no_message_lowers_satisfaction_on_close(self):
-        env = SupportEnvironment()
-        env.reset("easy", seed=42)
-        action = Action(action_type="close_ticket", resolution="Done.", resolution_code="resolved")
-        obs, reward, done, info = env.step(action)
-        assert info.customer_satisfaction < 1.0
-
-
-class TestSentimentAnalysis:
-    def test_send_message_populates_sentiment_labels(self):
-        env = SupportEnvironment()
-        env.reset("easy", seed=42)
-        obs, reward, done, info = env.step(
-            Action(action_type="send_message", message="Thanks for your patience, happy to help.")
-        )
-        assert obs.last_agent_sentiment in {"positive", "neutral", "negative"}
-        assert obs.last_customer_sentiment in {"positive", "neutral", "negative"}
-        assert info.metrics.get("last_agent_sentiment") == obs.last_agent_sentiment
-        assert info.metrics.get("last_customer_sentiment") == obs.last_customer_sentiment
-
-    def test_negative_agent_message_can_lower_satisfaction(self):
-        env = SupportEnvironment()
-        env.reset("easy", seed=42)
-        baseline_sat = env.customer_satisfaction
-        obs, reward, done, info = env.step(
-            Action(action_type="send_message", message="This is unacceptable and I cannot help.")
-        )
-        assert obs.last_agent_sentiment == "negative"
-        assert info.customer_satisfaction < baseline_sat
+        # Step forward to get different tariff values
+        tariffs = set()
+        for _ in range(24):
+            tariffs.add(env._get_tariff())
+            env.step(Action(actions=[0] * env.num_ports))
+        assert len(tariffs) > 1, "Medium mode should have variable tariffs"

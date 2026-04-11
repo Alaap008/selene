@@ -1,13 +1,14 @@
 version: "1.0"
 
 environment:
-  name: "CustomerServiceAgent"
+  name: "EVChargingScheduler"
   description: >
-    A real-world OpenEnv environment simulating an AI customer service agent.
-    The agent resolves support tickets (order lookups, refund processing,
-    fraud detection) by interacting with mock internal APIs and communicating
-    with simulated customers.
-  docker_image: "openenv-support-agent"
+    An RL benchmark for EV charging slot allocation.
+    The agent allocates charging slots across vehicles to minimise
+    energy cost and lateness while respecting grid limits.
+    Features dense per-step rewards, action masking, and an
+    algorithmic difficulty curriculum.
+  docker_image: "openenv-ev-charging"
   port: 8000
 
   action_type: "models.Action"
@@ -24,14 +25,14 @@ environment:
 
   tasks:
     - id: "easy"
-      description: "Look up an order status and relay tracking info to the customer."
+      description: "4 ports, 3 vehicles, flat tariff. Allocate charging to meet departure targets."
       difficulty: "easy"
     - id: "medium"
-      description: "Process a standard refund after verifying policy compliance."
+      description: "6 ports, 5 vehicles, time-of-use tariffs, moderate grid limit."
       difficulty: "medium"
     - id: "hard"
-      description: "Handle fraud-flagged customers, partial refunds, or escalations."
+      description: "8 ports, 8 vehicles, ToU tariffs, tight grid, charger failures, urgent departures."
       difficulty: "hard"
 
-  max_steps: 20
-  reward_range: [-1.0, 1.0]
+  max_steps: 48
+  reward_range: [-2.0, 3.0]

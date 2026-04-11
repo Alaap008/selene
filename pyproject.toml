@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "openenv-support-agent"
+name = "openenv-ev-charging"
 version = "0.1.0"
-description = "OpenEnv customer support environment with typed models, graders, and baseline agent."
+description = "OpenEnv EV Charging Scheduler — RL benchmark for smart charging allocation."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -23,5 +23,5 @@ server = "server.app:main"
 
 [tool.setuptools]
 include-package-data = true
-py-modules = ["baseline", "environment", "main", "models", "test_environment"]
+py-modules = ["baseline", "environment", "heuristic", "inference", "main", "models", "test_environment"]
 packages = ["server"]

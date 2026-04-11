@@ -1,3 +1,12 @@
+from __future__ import annotations
+
+"""
+FastAPI server for the EV Charging Scheduler OpenEnv environment.
+Implements all required OpenEnv endpoints:
+  /step, /reset, /state, /tasks, /grader, /health, /metadata, /schema, /mcp
+Plus /baseline for running heuristic baselines.
+"""
+
 import logging
 import os
 import threading
@@ -10,12 +19,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 
-from baseline import (
-    LocalEnvironmentClient,
-    create_openai_client,
-    run_baseline as execute_baseline,
-)
-from environment import SupportEnvironment
+from environment import ChargingEnvironment
 from models import Action, Observation, Reward, Info
 
 load_dotenv(Path(__file__).with_name(".env.local"), override=False)
@@ -27,15 +31,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("openenv")
 
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    logger.info("OpenEnv CustomerServiceAgent v1.0.0 started")
-    logger.info("Active sessions: %d  OPENAI_API_KEY set: %s", len(_session_envs), bool(os.environ.get("OPENAI_API_KEY")))
+    logger.info("OpenEnv EVChargingScheduler v1.0.0 started")
+    logger.info("Active sessions: %d", len(_session_envs))
     yield
 
+
 app = FastAPI(
-    title="Customer Service Agent OpenEnv",
-    description="A real-world OpenEnv environment simulating customer service ticket resolution.",
+    title="EV Charging Scheduler OpenEnv",
+    description=(
+        "An RL benchmark for allocating charging slots across electric vehicles "
+        "to minimise energy cost and lateness while respecting grid limits."
+    ),
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -43,10 +52,12 @@ app = FastAPI(
 SESSION_COOKIE_NAME = "openenv_session_id"
 _DEFAULT_SESSION_ID = "default"
 _session_lock = threading.Lock()
-_session_envs: dict[str, SupportEnvironment] = {_DEFAULT_SESSION_ID: SupportEnvironment()}
+_session_envs: dict[str, ChargingEnvironment] = {
+    _DEFAULT_SESSION_ID: ChargingEnvironment()
+}
 
 
-# ---- Response / Request models ----
+# ---- Request / Response models ----
 
 class StepResponse(BaseModel):
     observation: Observation
@@ -67,11 +78,11 @@ def _get_or_create_session_id(request: Request) -> tuple[str, bool]:
     return str(uuid.uuid4()), True
 
 
-def _get_env_for_session(session_id: str) -> SupportEnvironment:
+def _get_env_for_session(session_id: str) -> ChargingEnvironment:
     with _session_lock:
         env = _session_envs.get(session_id)
         if env is None:
-            env = SupportEnvironment()
+            env = ChargingEnvironment()
             _session_envs[session_id] = env
         return env
 
@@ -84,17 +95,10 @@ async def step(action: Action, request: Request):
     session_id = request.cookies.get(SESSION_COOKIE_NAME, _DEFAULT_SESSION_ID)
     env = _get_env_for_session(session_id)
     obs, reward, done, info = env.step(action)
-    detail = ""
-    if action.action_type == "call_api":
-        detail = f" {action.method} {action.endpoint}"
-    elif action.action_type == "send_message":
-        detail = f" \"{(action.message or '')[:60]}...\""
-    elif action.action_type == "close_ticket":
-        detail = f" code={action.resolution_code}"
     logger.info(
-        "STEP  session=%s  ticket=%s  action=%s%s  reward=%+.2f  done=%s",
-        session_id[:8], env.ticket.get("id", "?"), action.action_type, detail,
-        reward.value, done,
+        "STEP  session=%s  task=%s  step=%d  actions=%s  reward=%+.3f  done=%s",
+        session_id[:8], env.task_id, env.step_count,
+        action.actions[:4], reward.value, done,
     )
     return StepResponse(observation=obs, reward=reward, done=done, info=info)
 
@@ -115,9 +119,8 @@ async def reset(
     env = _get_env_for_session(session_id)
     obs = env.reset(task_id=task_id, seed=seed)
     logger.info(
-        "RESET session=%s  task=%s  seed=%s  ticket=%s  variant=%s  customer=%s",
-        session_id[:8], task_id, seed, obs.ticket_id,
-        env.variant.get("id", "?"), obs.customer_name,
+        "RESET session=%s  task=%s  seed=%s  ports=%d  vehicles=%d",
+        session_id[:8], task_id, seed, env.num_ports, env._total_vehicles,
     )
     return obs
 
@@ -139,17 +142,26 @@ async def get_tasks():
         "tasks": [
             {
                 "id": "easy",
-                "description": "Look up an order status and provide tracking info to the customer.",
+                "description": (
+                    "4 ports, 3 vehicles, flat tariff, no failures. "
+                    "Allocate charging to minimise cost and meet departure targets."
+                ),
                 "difficulty": "easy",
             },
             {
                 "id": "medium",
-                "description": "Process a standard refund after verifying policy compliance.",
+                "description": (
+                    "6 ports, 5 vehicles, time-of-use tariffs, moderate grid limit. "
+                    "Agent must shift load to cheap periods while meeting tighter deadlines."
+                ),
                 "difficulty": "medium",
             },
             {
                 "id": "hard",
-                "description": "Handle complex cases: fraud-flagged accounts, partial refunds past the return window, or escalation.",
+                "description": (
+                    "8 ports, 8 vehicles, ToU tariffs, tight grid limit, "
+                    "charger failures, and urgent departures. Full constraint satisfaction."
+                ),
                 "difficulty": "hard",
             },
         ],
@@ -168,8 +180,11 @@ async def health():
 async def metadata():
     """OpenEnv-compatible metadata endpoint."""
     return {
-        "name": "CustomerServiceAgent",
-        "description": "A real-world customer support environment with order lookup, refunds, and fraud handling.",
+        "name": "EVChargingScheduler",
+        "description": (
+            "An RL benchmark for EV charging slot allocation. "
+            "Minimise energy cost and lateness while respecting grid limits."
+        ),
     }
 
 
@@ -206,29 +221,18 @@ async def get_grader(request: Request):
 
 @app.post("/baseline")
 async def run_baseline_endpoint():
-    """Run the baseline agent against an isolated in-process environment."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="OPENAI_API_KEY not set")
+    """Run the heuristic baseline agent against an isolated in-process environment."""
+    from heuristic import run_all_tasks as run_heuristic
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4o")
-    seed = int(os.getenv("OPENAI_BASELINE_SEED", "42"))
-    logger.info("BASELINE started  model=%s  seed=%d", model, seed)
-    client = create_openai_client(api_key)
-    baseline_env = LocalEnvironmentClient(SupportEnvironment())
+    logger.info("BASELINE started (greedy heuristic)")
     try:
-        result = execute_baseline(
-            llm_client=client,
-            env_client=baseline_env,
-            model=model,
-            seed=seed,
-            fail_on_error=True,
+        result = run_heuristic()
+        logger.info(
+            "BASELINE complete  avg_score=%.4f",
+            result.get("average_score", 0.0),
         )
-        logger.info("BASELINE complete  avg_score=%.4f  results=%s", result["average_score"], {
-            t: r.get("score", 0.0) for t, r in result.get("baseline_results", {}).items()
-        })
         return result
-    except RuntimeError as exc:
+    except Exception as exc:
         logger.error("BASELINE failed: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -236,4 +240,8 @@ async def run_baseline_endpoint():
 @app.get("/")
 def root():
     """Health check."""
-    return {"status": "ok", "environment": "CustomerServiceAgent", "version": "1.0.0"}
+    return {
+        "status": "ok",
+        "environment": "EVChargingScheduler",
+        "version": "1.0.0",
+    }
